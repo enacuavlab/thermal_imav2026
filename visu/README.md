@@ -1,6 +1,6 @@
 # MLX90640 Frame Viewer
 
-PyQt5 viewer for the ZeroMQ JSON frame messages published by `mlx90640_stats`.
+PyQt5 viewer for the frame messages published by `mlx90640_stats`.
 
 Start the publisher:
 
@@ -12,6 +12,12 @@ Start the viewer:
 
 ```bash
 python3 visu/stats_viewer.py --connect tcp://127.0.0.1:5555
+```
+
+Or receive the protobuf frames published on eCAL:
+
+```bash
+python3 visu/stats_viewer.py --transport ecal --topic mlx90640_data
 ```
 
 Expected message shape:

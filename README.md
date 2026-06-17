@@ -3,7 +3,7 @@
 Small MLX90640 thermal camera project with:
 
 - a C/C++ reader using the Melexis driver API
-- ZeroMQ publishing of full 32x24 temperature frames
+- ZeroMQ and eCAL publishing of full 32x24 temperature frames
 - a PyQt5 viewer for live visualization
 
 ## Build
@@ -13,6 +13,7 @@ Dependencies:
 - CMake
 - CLI11
 - libzmq
+- eCAL
 - pkg-config
 
 ```bash
@@ -41,4 +42,10 @@ pip install -r visu/requirements.txt
 python3 visu/stats_viewer.py --connect tcp://127.0.0.1:5555
 ```
 
-The viewer receives JSON frames containing min/avg/max, dimensions, and 768 temperature values.
+To receive the protobuf frames over eCAL instead:
+
+```bash
+python3 visu/stats_viewer.py --transport ecal --topic mlx90640_data
+```
+
+The viewer receives JSON frames over ZeroMQ or `ThermalData` protobuf frames over eCAL.

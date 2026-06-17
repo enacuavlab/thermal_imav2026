@@ -1,26 +1,50 @@
 #!/usr/bin/env python3
 
-"""PyQt5 viewer for MLX90640 ZeroMQ frame messages."""
+"""PyQt5 viewer for MLX90640 frame messages."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
+from pathlib import Path
 import sys
+import threading
 import time
+from typing import Protocol
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 import zmq
 
+import ecal.nanobind_core as ecal_core
+from ecal.msg.common.core import ReceiveCallbackData
+from ecal.msg.proto.core import Subscriber as ProtoSubscriber
+
+GENERATED_DIR = Path(__file__).resolve().parent.parent / "generated"
+sys.path.append(str(GENERATED_DIR))
+
+from thermal_pb2 import ThermalData
+
 
 DEFAULT_ENDPOINT = "tcp://127.0.0.1:5555"
+DEFAULT_ECAL_TOPIC = "mlx90640_data"
 DEFAULT_WIDTH = 32
 DEFAULT_HEIGHT = 24
 
 
+class FrameSubscriber(Protocol):
+    label: str
+
+    def close(self) -> None:
+        ...
+
+    def receive_latest(self) -> dict | None:
+        ...
+
+
 class ZmqFrameSubscriber:
     def __init__(self, endpoint: str):
+        self.label = f"ZMQ SUB {endpoint}"
         self.context = zmq.Context.instance()
         self.socket = self.context.socket(zmq.SUB)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
@@ -37,6 +61,66 @@ class ZmqFrameSubscriber:
                 latest = json.loads(self.socket.recv_string(flags=zmq.NOBLOCK))
             except zmq.Again:
                 return latest
+
+
+class EcalFrameSubscriber:
+    def __init__(self, topic: str):
+        self.label = f"eCAL SUB {topic}"
+        self.frame = 0
+        self._lock = threading.Lock()
+        self._latest_message: dict | None = None
+        self._closed = False
+        self._owns_ecal = not ecal_core.is_initialized()
+        if self._owns_ecal:
+            ecal_core.initialize("MLX90640 Frame Viewer")
+        self.subscriber = ProtoSubscriber(ThermalData, topic)
+        self.subscriber.set_receive_callback(self._on_receive)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+
+        self._closed = True
+        self.subscriber.remove_receive_callback()
+        if self._owns_ecal and ecal_core.is_initialized():
+            ecal_core.finalize()
+
+    def receive_latest(self) -> dict | None:
+        with self._lock:
+            latest = self._latest_message
+            self._latest_message = None
+        return latest
+
+    def _on_receive(self, pub_id: ecal_core.TopicId, data: ReceiveCallbackData[ThermalData]) -> None:
+        del pub_id
+        with self._lock:
+            self._latest_message = self._to_message(data.message)
+
+    def _to_message(self, thermal_data) -> dict:
+        temperatures = list(thermal_data.data)
+        finite = [value for value in temperatures if math.isfinite(value)]
+        self.frame += 1
+
+        if finite:
+            minimum = min(finite)
+            maximum = max(finite)
+            average = sum(finite) / len(finite)
+        else:
+            minimum = math.nan
+            maximum = math.nan
+            average = math.nan
+
+        return {
+            "frame": self.frame,
+            "subpage": thermal_data.subpage,
+            "min": minimum,
+            "avg": average,
+            "max": maximum,
+            "count": len(finite),
+            "width": thermal_data.cols or DEFAULT_WIDTH,
+            "height": thermal_data.rows or DEFAULT_HEIGHT,
+            "temperatures": temperatures,
+        }
 
 
 class StatTile(QtWidgets.QFrame):
@@ -183,15 +267,15 @@ class ThermalFrame(QtWidgets.QWidget):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, endpoint: str):
+    def __init__(self, subscriber: FrameSubscriber):
         super().__init__()
-        self.subscriber = ZmqFrameSubscriber(endpoint)
+        self.subscriber = subscriber
         self.last_message_time = None
 
         self.setWindowTitle("MLX90640 Frame Viewer")
         self.resize(900, 620)
 
-        self.status_label = QtWidgets.QLabel(f"SUB {endpoint}")
+        self.status_label = QtWidgets.QLabel(self.subscriber.label)
         self.status_label.setObjectName("statusLabel")
 
         self.min_tile = StatTile("Min", " C")
@@ -237,7 +321,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def poll_messages(self) -> None:
         try:
             message = self.subscriber.receive_latest()
-        except (json.JSONDecodeError, UnicodeDecodeError, zmq.ZMQError) as error:
+        except (json.JSONDecodeError, UnicodeDecodeError, zmq.ZMQError, RuntimeError) as error:
             self.status_label.setText(f"Receive error: {error}")
             return
 
@@ -252,7 +336,6 @@ class MainWindow(QtWidgets.QMainWindow):
         minimum = float(message.get("min", math.nan))
         average = float(message.get("avg", math.nan))
         maximum = float(message.get("max", math.nan))
-        print(message)
 
         self.min_tile.set_value(minimum)
         self.avg_tile.set_value(average)
@@ -279,13 +362,32 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PyQt5 viewer for MLX90640 ZeroMQ frames")
+    parser = argparse.ArgumentParser(description="PyQt5 viewer for MLX90640 frames")
+    parser.add_argument(
+        "--transport",
+        choices=("zmq", "ecal"),
+        default="zmq",
+        help="Transport to use for receiving frames",
+    )
     parser.add_argument("--connect", default=DEFAULT_ENDPOINT, help="ZeroMQ endpoint to connect to")
+    parser.add_argument("--topic", default=DEFAULT_ECAL_TOPIC, help="eCAL topic to subscribe to")
     return parser.parse_args()
+
+
+def make_subscriber(args: argparse.Namespace) -> FrameSubscriber:
+    if args.transport == "ecal":
+        return EcalFrameSubscriber(args.topic)
+    return ZmqFrameSubscriber(args.connect)
 
 
 def main() -> int:
     args = parse_args()
+    try:
+        subscriber = make_subscriber(args)
+    except RuntimeError as error:
+        print(error, file=sys.stderr)
+        return 1
+
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(
         """
@@ -316,7 +418,7 @@ def main() -> int:
         """
     )
 
-    window = MainWindow(args.connect)
+    window = MainWindow(subscriber)
     window.show()
     return app.exec_()
 
