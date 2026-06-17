@@ -1,0 +1,19 @@
+[Unit]
+Description=MLX90640 driver
+After=network.target network-online.target
+
+[Service]
+Type=simple
+ 
+
+WorkingDirectory=/home/pprz/thermal
+ExecStart=/home/pprz/thermal/build/thermal_mlx90640 --device /dev/i2c-4 --refresh-mode 4 --publish tcp://*:5555
+ 
+Restart=on-failure
+RestartSec=2 
+# Configures the time to wait before service is stopped forcefully.
+TimeoutStopSec=300
+ 
+[Install]
+WantedBy=default.target
+
