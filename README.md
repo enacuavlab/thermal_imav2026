@@ -6,6 +6,12 @@ Small MLX90640 thermal camera project with:
 - ZeroMQ and eCAL publishing of full 32x24 temperature frames
 - a PyQt5 viewer for live visualization
 
+
+## Allow passwordless shutdown
+
+sudo cp pprzlink-shutdown /etc/sudoers.d/
+
+
 ## Build
 
 Dependencies:
