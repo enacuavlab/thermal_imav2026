@@ -21,7 +21,7 @@ message Pose {
 message PprzMsg {
   int32 src = 1;
   int32 dst = 2;
-  int32 class = 3;
+  int32 msg_class = 3;
   int32 msg_id = 4;
   string msg_name = 5;
   bytes payload = 6;
