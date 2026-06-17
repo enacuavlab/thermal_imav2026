@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+import subprocess
 
 
 GENERATED_DIR = Path(__file__).resolve().parent.parent / "generated"
@@ -22,8 +23,12 @@ import ecal.nanobind_core as ecal_core
 import serial
 from ecal.msg.proto.core import Publisher as ProtoPublisher
 from pprzlink import messages_xml_map
+from pprzlink.message import PprzMessage
 from pprzlink.pprz_transport import PprzTransport
 from thermal_pb2 import PprzMsg
+
+
+ecal_rec: subprocess.Popen | None = None
 
 
 def resolve_message_name(class_id: int, msg_id: int) -> str:
@@ -84,6 +89,83 @@ def format_payload(payload: bytes) -> str:
     return payload.hex(" ")
 
 
+def start_ecal_recording() -> None:
+    global ecal_rec
+
+    if ecal_rec is not None and ecal_rec.poll() is None:
+        print("ecal_rec is already recording")
+        return
+
+    print("start recording")
+    ecal_rec = subprocess.Popen(["ecal_rec", "-r", "--activate"])
+
+
+def stop_ecal_recording() -> None:
+    global ecal_rec
+
+    if ecal_rec is None:
+        return
+
+    if ecal_rec.poll() is None:
+        print("stop recording")
+        ecal_rec.terminate()
+        try:
+            ecal_rec.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            ecal_rec.kill()
+            ecal_rec.wait()
+
+    ecal_rec = None
+
+
+def on_payload_command(
+    source: int,
+    destination: int,
+    pprz_message: PprzMessage,
+) -> None:
+    # PAYLOAD_COMMAND needs domain-specific handling here.
+    if chr(pprz_message.command[0]) == 'r':
+        if pprz_message.command[1] == 1:
+            start_ecal_recording()
+        elif pprz_message.command[1] == 0:
+            stop_ecal_recording()
+    elif chr(pprz_message.command[0]) == 's':
+        if pprz_message.command[1] == 0:
+            print("shutdown")
+            stop_ecal_recording()
+            subprocess.run(["shutdown", "now"], check=False)
+    else:
+        print(pprz_message)
+
+
+def decode_pprz_message(class_id: int, msg_id: int, payload: bytes) -> PprzMessage:
+    pprz_message = PprzMessage(class_id, msg_id)
+    pprz_message.binary_to_payload(payload)
+    return pprz_message
+
+
+def dispatch_message(
+    source: int,
+    destination: int,
+    class_id: int,
+    msg_id: int,
+    message_name: str,
+    payload: bytes,
+) -> None:
+    if message_name.rsplit(".", 1)[-1] == "PAYLOAD_COMMAND":
+        try:
+            pprz_message = decode_pprz_message(class_id, msg_id, payload)
+        except Exception as exc:
+            print(f"Could not decode {message_name}: {exc}", file=sys.stderr, flush=True)
+            return
+
+        on_payload_command(
+            source,
+            destination,
+            pprz_message,
+        )
+
+
 def run(args: argparse.Namespace) -> None:
     if args.messages:
         messages_xml_map.parse_messages(args.messages)
@@ -114,6 +196,14 @@ def run(args: argparse.Namespace) -> None:
                     print(f"Skipping packet: {exc}", file=sys.stderr, flush=True)
                     continue
 
+                dispatch_message(
+                    source,
+                    destination,
+                    class_id,
+                    msg_id,
+                    message_name,
+                    payload,
+                )
                 ecal_publisher.publish(
                     source,
                     destination,
@@ -129,6 +219,7 @@ def run(args: argparse.Namespace) -> None:
                         flush=True,
                     )
     finally:
+        stop_ecal_recording()
         ecal_publisher.close()
 
 
