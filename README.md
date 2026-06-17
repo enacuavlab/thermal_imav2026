@@ -6,6 +6,14 @@ Small MLX90640 thermal camera project with:
 - ZeroMQ and eCAL publishing of full 32x24 temperature frames
 - a PyQt5 viewer for live visualization
 
+## Wifi
+
+SSID: OctIR
+password: same as in voliere
+address: 192.168.10.1/24
+No DHCP, so set a manual address in the /24 range.
+
+
 
 ## Allow passwordless shutdown
 
