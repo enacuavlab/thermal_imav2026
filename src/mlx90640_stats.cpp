@@ -297,7 +297,7 @@ int main(int argc, char **argv)
             );
 
             Stats stats = calculateStats(temperatures);
-            printStats(stats);
+            //printStats(stats);
             publisher.publish(stats, temperatures, frame, subpage);
             send_ecal(&ecal_publisher, stats, temperatures, frame, subpage);
         }
