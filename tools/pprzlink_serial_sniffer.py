@@ -97,7 +97,7 @@ def start_ecal_recording() -> None:
         return
 
     print("start recording")
-    ecal_rec = subprocess.Popen(["ecal_rec", "-r", "--activate"])
+    ecal_rec = subprocess.Popen(["ecal_rec", "-r", "--activate", "-d", "/home/pprz/sd/logs"])
 
 
 def stop_ecal_recording() -> None:
@@ -133,7 +133,7 @@ def on_payload_command(
         if pprz_message.command[1] == 0:
             print("shutdown")
             stop_ecal_recording()
-            subprocess.run(["shutdown", "now"], check=False)
+            subprocess.run(["sudo", "shutdown", "now"], check=False)
     else:
         print(pprz_message)
 
