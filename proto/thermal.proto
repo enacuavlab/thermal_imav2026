@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+message ThermalData {
+  int32 subpage = 1;
+  int32 rows = 2;
+  int32 cols = 3;
+  repeated float data = 4;
+}
+
+
+message Pose {
+  float east = 1;
+  float north = 2;
+  float up = 3;
+  float phi = 4;
+  float theta = 5;
+  float psi = 6;
+}
+
+
+message PprzMsg {
+  int32 src = 1;
+  int32 dst = 2;
+  int32 class = 3;
+  int32 msg_id = 4;
+  string msg_name = 5;
+  bytes payload = 6;
+}
+

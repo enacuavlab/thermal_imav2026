@@ -1,3 +1,5 @@
+#include <ecal/ecal.h>
+#include <ecal/msg/protobuf/publisher.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -14,7 +16,7 @@
 
 #include <CLI/CLI.hpp>
 #include <zmq.h>
-
+#include <thermal.pb.h>
 extern "C" {
 #include "MLX90640_API.h"
 #include "MLX90640_I2C_Driver.h"
@@ -102,6 +104,25 @@ void checkMlx(int error, const std::string &operation)
     if (error < 0) {
         throw std::runtime_error(operation + " failed with MLX90640 error " + std::to_string(error));
     }
+}
+
+
+void send_ecal(eCAL::protobuf::CPublisher<ThermalData>* pub, const Stats &stats, const float *temperatures, int frame, int subpage) {
+  ThermalData msg;
+  msg.set_subpage(subpage);
+  msg.set_rows(24);
+  msg.set_cols(32);
+  for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
+      float value = temperatures[i];
+      if (std::isfinite(value)) {
+          msg.add_data(value);
+      } else {
+          msg.add_data(0);
+      }
+  }
+  pub->Send(msg);
+
+
 }
 
 class ZmqPublisher {
@@ -240,6 +261,10 @@ int main(int argc, char **argv)
         paramsMLX90640 params = {};
         ZmqPublisher publisher(options.publishEndpoint);
 
+
+	 eCAL::Initialize("MLX90640_driver");
+	 eCAL::protobuf::CPublisher<ThermalData> ecal_publisher("mlx90640_data");
+
         if (setenv("MLX90640_I2C_DEVICE", options.device.c_str(), 1) != 0) {
             throw std::runtime_error("failed to set MLX90640_I2C_DEVICE");
         }
@@ -274,6 +299,7 @@ int main(int argc, char **argv)
             Stats stats = calculateStats(temperatures);
             printStats(stats);
             publisher.publish(stats, temperatures, frame, subpage);
+            send_ecal(&ecal_publisher, stats, temperatures, frame, subpage);
         }
 
         return 0;
