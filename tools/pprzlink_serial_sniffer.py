@@ -123,11 +123,6 @@ def maybe_set_system_time_from_gps(gps_datetime: datetime, now: datetime) -> Non
     drift = abs(gps_datetime - now)
     gps_datetime_str = gps_datetime.isoformat().replace("+00:00", "Z")
     if drift <= TIME_SYNC_THRESHOLD:
-        print(
-            f"GPS time sync not needed: date={gps_datetime_str} "
-            f"drift={drift.total_seconds():.3f}s",
-            flush=True,
-        )
         return
 
     if (
@@ -211,7 +206,7 @@ def on_gps_int(pprz_message: PprzMessage) -> None:
     now = datetime.now(timezone.utc)
     gps_datetime = infer_datetime_from_gps_tow(pprz_message.tow, now)
     gps_datetime_str = gps_datetime.isoformat().replace("+00:00", "Z")
-    print(f"GPS_INT tow={pprz_message.tow} date={gps_datetime_str}", flush=True)
+    #print(f"GPS_INT tow={pprz_message.tow} date={gps_datetime_str}", flush=True)
     maybe_set_system_time_from_gps(gps_datetime, now)
 
 

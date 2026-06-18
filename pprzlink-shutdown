@@ -1,0 +1,4 @@
+pprz ALL=(root) NOPASSWD: /usr/sbin/shutdown now
+pprz ALL=(root) NOPASSWD: /usr/bin/date -u -s @*
+
+
