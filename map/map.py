@@ -36,8 +36,6 @@ from pprzlink.ivy import IvyMessagesInterface
 DEFAULT_ENDPOINT = "tcp://127.0.0.1:5555"
 DEFAULT_ECAL_THERMAL_TOPIC = "mlx90640_data"
 DEFAULT_ECAL_PPRZ_TOPIC = "pprz_msg"
-MIN_TEMPERATURE_C = 10.0
-MAX_TEMPERATURE_C = 60.0
 MIN_IMAGE_VALUE = 0.0
 MAX_IMAGE_VALUE = 255.0
 DISPLAY_SCALE = 10
@@ -51,16 +49,33 @@ THERMAL_SENSOR_VERTICAL_FOV_DEG = 35.0
 GROUND_ALTITUDE_M = 0.0
 ROTORCRAFT_FP_POS_SCALE = 0.0039063
 ROTORCRAFT_FP_ATTITUDE_SCALE_DEG = 0.0139882
-AREA_XMIN = -10
-AREA_XMAX = 0
-AREA_YMIN = -30
+AREA_XMIN = 10
+AREA_XMAX = 45
+AREA_YMIN = -50
 AREA_YMAX = -10
+
+MIN_TEMPERATURE_C = 30
+MAX_TEMPERATURE_C = 60
 # meters per pixel
-AREA_RESOLUTION = 0.5
+AREA_RESOLUTION = 0.3
 MAP_BLEND_REPLACE = "replace"
 MAP_BLEND_WEIGHTED = "weighted"
-MAP_BLEND_MODE = MAP_BLEND_WEIGHTED
+MAP_BLEND_MODE = MAP_BLEND_REPLACE
 MAP_BLEND_ALPHA = 0.4
+DRONE_MARKER_RADIUS_PX = 6
+DRONE_HEADING_LENGTH_M = 2.0
+DRONE_HEADING_THICKNESS_PX = 2
+PROJECTED_IMAGE_OUTLINE_THICKNESS_PX = 2
+TEMPERATURE_LABEL_ORIGIN_PX = (8, 22)
+DRONE_POSITION_BOUNDS_LABEL_ORIGIN_PX = (8, 44)
+THERMAL_PALETTE_RGB = (
+    (0.00, (18, 20, 58)),
+    (0.18, (31, 87, 151)),
+    (0.38, (46, 161, 171)),
+    (0.58, (240, 202, 74)),
+    (0.78, (226, 103, 51)),
+    (1.00, (250, 241, 220)),
+)
 
 
 class Mapper:
@@ -89,6 +104,10 @@ class Mapper:
         self.last_rotorcraft_fp = None
         self.last_position_m: np.ndarray | None = None
         self.last_attitude_deg: np.ndarray | None = None
+        self.drone_position_min_east: float | None = None
+        self.drone_position_max_east: float | None = None
+        self.drone_position_min_north: float | None = None
+        self.drone_position_max_north: float | None = None
         self.last_image: np.ndarray | None = None
         self.last_subpage: int | None = None
         self.thermal_sensor_rotation_deg = THERMAL_SENSOR_ROTATION_DEG.copy()
@@ -219,8 +238,24 @@ class Mapper:
         self.last_rotorcraft_fp = msg
         self.last_position_m = self.rotorcraft_position_m(msg)
         self.last_attitude_deg = self.rotorcraft_attitude_deg(msg)
+        self.update_drone_position_bounds(self.last_position_m)
         print(self.last_position_m)
         #print(f"ROTORCRAFT_FP from {ac_id}: {msg}", flush=True)
+
+    def update_drone_position_bounds(self, position_m: np.ndarray) -> None:
+        east = float(position_m[0])
+        north = float(position_m[1])
+        if self.drone_position_min_east is None:
+            self.drone_position_min_east = east
+            self.drone_position_max_east = east
+            self.drone_position_min_north = north
+            self.drone_position_max_north = north
+            return
+
+        self.drone_position_min_east = min(self.drone_position_min_east, east)
+        self.drone_position_max_east = max(self.drone_position_max_east, east)
+        self.drone_position_min_north = min(self.drone_position_min_north, north)
+        self.drone_position_max_north = max(self.drone_position_max_north, north)
 
     @staticmethod
     def rotorcraft_position_m(msg) -> np.ndarray:
@@ -252,7 +287,7 @@ class Mapper:
         )
         temperatures = np.nan_to_num(temperatures, nan=MIN_IMAGE_VALUE)
         temperatures = np.clip(temperatures, MIN_IMAGE_VALUE, MAX_IMAGE_VALUE)
-        return temperatures.astype(np.uint8)
+        return temperatures.astype(np.float32)
 
     def create_area_image(self) -> np.ndarray:
         if self.area_resolution <= 0:
@@ -262,7 +297,7 @@ class Mapper:
         height = int(np.ceil((self.area_ymax - self.area_ymin) / self.area_resolution))
         if width <= 0 or height <= 0:
             raise ValueError("area bounds must produce a positive image size")
-        return np.zeros((height, width), dtype=np.uint8)
+        return np.zeros((height, width), dtype=np.float32)
 
     def project_last_image_to_area(self) -> bool:
         if (
@@ -327,7 +362,7 @@ class Mapper:
             )
             self.area_image[existing_pixels] = np.clip(
                 blended, MIN_IMAGE_VALUE, MAX_IMAGE_VALUE
-            ).astype(np.uint8)
+            )
         else:
             raise ValueError(f"unknown map blend mode: {self.map_blend_mode}")
 
@@ -431,20 +466,84 @@ class Mapper:
             and max_row >= 0.0
         )
 
-    def scale_temperature_image_for_display(self, image: np.ndarray) -> np.ndarray:
-        span = MAX_TEMPERATURE_C - MIN_TEMPERATURE_C
-        normalized = (image.astype(np.float32) - MIN_TEMPERATURE_C) / span
+    def temperature_scale_bounds(self, image: np.ndarray) -> tuple[float, float] | None:
+        if MIN_TEMPERATURE_C == 0 and MAX_TEMPERATURE_C == 0:
+            bounds = self.temperature_data_bounds(image)
+            if bounds is None:
+                return None
+            low, high = bounds
+        else:
+            low = float(MIN_TEMPERATURE_C)
+            high = float(MAX_TEMPERATURE_C)
+
+        if np.isclose(low, high):
+            low -= 1.0
+            high += 1.0
+        return low, high
+
+    @staticmethod
+    def temperature_data_bounds(image: np.ndarray) -> tuple[float, float] | None:
+        valid_values = image[image > 0]
+        if valid_values.size == 0:
+            return None
+        return float(np.min(valid_values)), float(np.max(valid_values))
+
+    def scale_temperature_image_for_display(
+        self,
+        image: np.ndarray,
+    ) -> tuple[np.ndarray, tuple[float, float] | None]:
+        valid_mask = image > 0
+        bounds = self.temperature_scale_bounds(image)
+        if bounds is None:
+            return np.zeros((*image.shape, 3), dtype=np.uint8), None
+
+        low, high = bounds
+        normalized = (image.astype(np.float32) - low) / (high - low)
         normalized = np.clip(normalized, 0.0, 1.0)
-        return (normalized * MAX_IMAGE_VALUE).astype(np.uint8)
+        return self.apply_thermal_palette(normalized, valid_mask), bounds
+
+    @staticmethod
+    def apply_thermal_palette(normalized: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+        color_image = np.zeros((*normalized.shape, 3), dtype=np.uint8)
+        for index in range(len(THERMAL_PALETTE_RGB) - 1):
+            left_t, left_rgb = THERMAL_PALETTE_RGB[index]
+            right_t, right_rgb = THERMAL_PALETTE_RGB[index + 1]
+            segment_mask = (
+                valid_mask
+                & (normalized >= left_t)
+                & (normalized <= right_t)
+            )
+            if not np.any(segment_mask):
+                continue
+
+            local = (normalized[segment_mask] - left_t) / (right_t - left_t)
+            left = np.array(left_rgb, dtype=np.float32)
+            right = np.array(right_rgb, dtype=np.float32)
+            rgb = left + (right - left) * local[:, None]
+            color_image[segment_mask] = rgb[:, ::-1].astype(np.uint8)
+        return color_image
 
     def display_images(self) -> bool:
         if self.last_image is not None:
             self.display_scaled_image(WINDOW_NAME, self.last_image, DISPLAY_SCALE)
-        self.display_scaled_image(MAP_WINDOW_NAME, self.area_image, DISPLAY_SCALE)
+        self.display_scaled_image(
+            MAP_WINDOW_NAME,
+            self.area_image,
+            DISPLAY_SCALE,
+            draw_drone=True,
+            draw_temperature_label=True,
+        )
         return cv2.waitKey(1) == ord("q")
 
-    def display_scaled_image(self, window_name: str, image: np.ndarray, scale: int) -> None:
-        display_image = self.scale_temperature_image_for_display(image)
+    def display_scaled_image(
+        self,
+        window_name: str,
+        image: np.ndarray,
+        scale: int,
+        draw_drone: bool = False,
+        draw_temperature_label: bool = False,
+    ) -> None:
+        display_image, scale_bounds = self.scale_temperature_image_for_display(image)
         scaled_image = cv2.resize(
             display_image,
             None,
@@ -452,7 +551,146 @@ class Mapper:
             fy=scale,
             interpolation=cv2.INTER_NEAREST,
         )
+        if draw_drone:
+            self.draw_projected_image_shape(scaled_image, scale)
+            self.draw_drone_position(scaled_image, scale)
+            self.draw_drone_position_bounds_label(scaled_image)
+        if draw_temperature_label:
+            data_bounds = self.temperature_data_bounds(image)
+            if data_bounds is not None:
+                self.draw_temperature_label(scaled_image, data_bounds)
         cv2.imshow(window_name, scaled_image)
+
+    def draw_drone_position_bounds_label(self, image: np.ndarray) -> None:
+        if self.drone_position_min_east is None:
+            return
+
+        text = (
+            f"x [{self.drone_position_min_east:.1f} ... "
+            f"{self.drone_position_max_east:.1f}]  "
+            f"y [{self.drone_position_min_north:.1f} ... "
+            f"{self.drone_position_max_north:.1f}]"
+        )
+        self.draw_label(image, text, DRONE_POSITION_BOUNDS_LABEL_ORIGIN_PX)
+
+    def draw_temperature_label(
+        self,
+        image: np.ndarray,
+        data_bounds: tuple[float, float],
+    ) -> None:
+        low, high = data_bounds
+        text = f"min {low:.1f} C  max {high:.1f} C"
+        self.draw_label(image, text, TEMPERATURE_LABEL_ORIGIN_PX)
+
+    @staticmethod
+    def draw_label(
+        image: np.ndarray,
+        text: str,
+        origin: tuple[int, int],
+    ) -> None:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        text_size, baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        top_left = (origin[0] - 4, origin[1] - text_size[1] - 4)
+        bottom_right = (origin[0] + text_size[0] + 4, origin[1] + baseline + 4)
+        cv2.rectangle(image, top_left, bottom_right, (0, 0, 0), -1)
+        cv2.putText(
+            image,
+            text,
+            origin,
+            font,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    def draw_projected_image_shape(self, image: np.ndarray, scale: int) -> None:
+        if (
+            self.last_image is None
+            or self.last_position_m is None
+            or self.last_attitude_deg is None
+        ):
+            return
+
+        corners = self.projected_image_corners_px()
+        if corners is None:
+            return
+        if not self.projected_bounds_intersect_area(corners):
+            return
+
+        scaled_corners = np.round(corners * scale).astype(np.int32)
+        cv2.polylines(
+            image,
+            [scaled_corners],
+            isClosed=True,
+            color=(0, 0, 0),
+            thickness=PROJECTED_IMAGE_OUTLINE_THICKNESS_PX + 2,
+            lineType=cv2.LINE_AA,
+        )
+        cv2.polylines(
+            image,
+            [scaled_corners],
+            isClosed=True,
+            color=(51, 103, 226),
+            thickness=PROJECTED_IMAGE_OUTLINE_THICKNESS_PX,
+            lineType=cv2.LINE_AA,
+        )
+
+    def draw_drone_position(self, image: np.ndarray, scale: int) -> None:
+        if self.last_position_m is None:
+            return
+
+        col, row = self.world_to_area_pixel(
+            float(self.last_position_m[0]),
+            float(self.last_position_m[1]),
+        )
+        height, width = self.area_image.shape
+        if col < 0.0 or col >= width or row < 0.0 or row >= height:
+            return
+
+        center = (int(round(col * scale)), int(round(row * scale)))
+        self.draw_drone_heading(image, center, scale)
+        cv2.circle(image, center, DRONE_MARKER_RADIUS_PX + 2, (0, 0, 0), -1)
+        cv2.circle(image, center, DRONE_MARKER_RADIUS_PX, (255, 255, 255), -1)
+        cv2.circle(image, center, 2, (51, 103, 226), -1)
+
+    def draw_drone_heading(
+        self,
+        image: np.ndarray,
+        center: tuple[int, int],
+        scale: int,
+    ) -> None:
+        if self.last_attitude_deg is None:
+            return
+
+        heading_rad = np.deg2rad(float(self.last_attitude_deg[2]))
+        length_px = DRONE_HEADING_LENGTH_M / self.area_resolution * scale
+        end = (
+            int(round(center[0] + np.sin(heading_rad) * length_px)),
+            int(round(center[1] - np.cos(heading_rad) * length_px)),
+        )
+        cv2.arrowedLine(
+            image,
+            center,
+            end,
+            (0, 0, 0),
+            DRONE_HEADING_THICKNESS_PX + 2,
+            cv2.LINE_AA,
+            0,
+            0.25,
+        )
+        cv2.arrowedLine(
+            image,
+            center,
+            end,
+            (51, 103, 226),
+            DRONE_HEADING_THICKNESS_PX,
+            cv2.LINE_AA,
+            0,
+            0.25,
+        )
 
     def __enter__(self):
         return self
