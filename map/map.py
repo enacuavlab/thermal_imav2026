@@ -7,12 +7,23 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
+import time
 from os import getenv, path
+from pathlib import Path
 
 import cv2
+import ecal.nanobind_core as ecal_core
+from ecal.msg.common.core import ReceiveCallbackData
+from ecal.msg.proto.core import Subscriber as ProtoSubscriber
 import numpy as np
 import zmq
 from scipy.spatial.transform import Rotation
+
+GENERATED_DIR = Path(__file__).resolve().parent.parent / "generated"
+sys.path.append(str(GENERATED_DIR))
+
+from thermal_pb2 import PprzMsg, ThermalData
 
 PPRZ_HOME = getenv("PAPARAZZI_HOME", "/home/fabien/paparazzi")
 pprz_python_path = path.join(PPRZ_HOME, "var/lib/python")
@@ -23,6 +34,8 @@ from pprzlink.ivy import IvyMessagesInterface
 
 
 DEFAULT_ENDPOINT = "tcp://127.0.0.1:5555"
+DEFAULT_ECAL_THERMAL_TOPIC = "mlx90640_data"
+DEFAULT_ECAL_PPRZ_TOPIC = "pprz_msg"
 MIN_TEMPERATURE_C = 10.0
 MAX_TEMPERATURE_C = 60.0
 MIN_IMAGE_VALUE = 0.0
@@ -38,10 +51,10 @@ THERMAL_SENSOR_VERTICAL_FOV_DEG = 35.0
 GROUND_ALTITUDE_M = 0.0
 ROTORCRAFT_FP_POS_SCALE = 0.0039063
 ROTORCRAFT_FP_ATTITUDE_SCALE_DEG = 0.0139882
-AREA_XMIN = -8
-AREA_XMAX = 8
-AREA_YMIN = -8
-AREA_YMAX = 8
+AREA_XMIN = -10
+AREA_XMAX = 0
+AREA_YMIN = -30
+AREA_YMAX = -10
 # meters per pixel
 AREA_RESOLUTION = 0.5
 MAP_BLEND_REPLACE = "replace"
@@ -53,9 +66,26 @@ MAP_BLEND_ALPHA = 0.4
 class Mapper:
     """Receive thermal frames and Paparazzi telemetry for mapping."""
 
-    def __init__(self, endpoint: str = DEFAULT_ENDPOINT, ivy_bus: str | None = None):
+    def __init__(
+        self,
+        endpoint: str = DEFAULT_ENDPOINT,
+        ivy_bus: str | None = None,
+        transport: str = "ecal",
+        thermal_topic: str = DEFAULT_ECAL_THERMAL_TOPIC,
+        pprz_topic: str = DEFAULT_ECAL_PPRZ_TOPIC,
+    ):
         self.endpoint = endpoint
+        self.transport = transport
+        self.thermal_topic = thermal_topic
+        self.pprz_topic = pprz_topic
         self._closed = False
+        self._owns_ecal = False
+        self._latest_frame: dict | None = None
+        self._lock = threading.Lock()
+        self._thermal_subscriber = None
+        self._pprz_subscriber = None
+        self._interface = None
+        self.socket = None
         self.last_rotorcraft_fp = None
         self.last_position_m: np.ndarray | None = None
         self.last_attitude_deg: np.ndarray | None = None
@@ -71,6 +101,24 @@ class Mapper:
         self.map_blend_mode = MAP_BLEND_MODE
         self.map_blend_alpha = MAP_BLEND_ALPHA
 
+        if self.transport == "ecal":
+            self._init_ecal()
+        elif self.transport == "zmq":
+            self._init_zmq(endpoint, ivy_bus)
+        else:
+            raise ValueError(f"unknown transport: {self.transport}")
+
+    def _init_ecal(self) -> None:
+        self._owns_ecal = not ecal_core.is_initialized()
+        if self._owns_ecal:
+            ecal_core.initialize("Thermal Map")
+
+        self._thermal_subscriber = ProtoSubscriber(ThermalData, self.thermal_topic)
+        self._thermal_subscriber.set_receive_callback(self._on_thermal_receive)
+        self._pprz_subscriber = ProtoSubscriber(PprzMsg, self.pprz_topic)
+        self._pprz_subscriber.set_receive_callback(self._on_pprz_receive)
+
+    def _init_zmq(self, endpoint: str, ivy_bus: str | None) -> None:
         self.context = zmq.Context.instance()
         self.socket = self.context.socket(zmq.SUB)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
@@ -89,15 +137,17 @@ class Mapper:
     def run(self) -> None:
         try:
             while True:
-                message = self.socket.recv_string()
-                frame = json.loads(message)
-                image = self.create_grayscale_image(frame)
-                self.last_image = image
-                self.last_subpage = int(frame["subpage"])
-                self.project_last_image_to_area()
-                # print(message, flush=True)
+                frame = self.receive_frame()
+                if frame is not None:
+                    image = self.create_grayscale_image(frame)
+                    self.last_image = image
+                    self.last_subpage = int(frame["subpage"])
+                    self.project_last_image_to_area()
+                    # print(frame, flush=True)
                 if self.display_images():
                     break
+                if self.transport == "ecal" and frame is None:
+                    time.sleep(0.01)
         finally:
             self.close()
 
@@ -106,16 +156,71 @@ class Mapper:
             return
 
         self._closed = True
-        self.socket.close(0)
-        print("Shutting down ivy interface...")
-        self._interface.shutdown()
+        if self.socket is not None:
+            self.socket.close(0)
+        if self._interface is not None:
+            print("Shutting down ivy interface...")
+            self._interface.shutdown()
+        if self._thermal_subscriber is not None:
+            self._thermal_subscriber.remove_receive_callback()
+        if self._pprz_subscriber is not None:
+            self._pprz_subscriber.remove_receive_callback()
+        if self._owns_ecal and ecal_core.is_initialized():
+            ecal_core.finalize()
         cv2.destroyAllWindows()
+
+    def receive_frame(self) -> dict | None:
+        if self.transport == "ecal":
+            with self._lock:
+                latest = self._latest_frame
+                self._latest_frame = None
+            return latest
+
+        message = self.socket.recv_string()
+        return json.loads(message)
+
+    def _on_thermal_receive(
+        self,
+        pub_id: ecal_core.TopicId,
+        data: ReceiveCallbackData[ThermalData],
+    ) -> None:
+        del pub_id
+        with self._lock:
+            self._latest_frame = self._thermal_to_frame(data.message)
+
+    def _thermal_to_frame(self, thermal_data: ThermalData) -> dict:
+        return {
+            "subpage": thermal_data.subpage,
+            "width": thermal_data.cols,
+            "height": thermal_data.rows,
+            "temperatures": list(thermal_data.data),
+        }
+
+    def _on_pprz_receive(
+        self,
+        pub_id: ecal_core.TopicId,
+        data: ReceiveCallbackData[PprzMsg],
+    ) -> None:
+        del pub_id
+        pprz_msg = data.message
+        if pprz_msg.msg_name.rsplit(".", 1)[-1] != "ROTORCRAFT_FP":
+            return
+
+        try:
+            msg = pprz_message.PprzMessage(pprz_msg.msg_class, pprz_msg.msg_id)
+            msg.binary_to_payload(bytes(pprz_msg.payload))
+        except Exception as exc:
+            print(f"Could not decode {pprz_msg.msg_name}: {exc}", file=sys.stderr, flush=True)
+            return
+
+        self.on_rotorcraft_fp(pprz_msg.src, msg)
 
     def on_rotorcraft_fp(self, ac_id, msg) -> None:
         self.last_rotorcraft_fp = msg
         self.last_position_m = self.rotorcraft_position_m(msg)
         self.last_attitude_deg = self.rotorcraft_attitude_deg(msg)
-        print(f"ROTORCRAFT_FP from {ac_id}: {msg}", flush=True)
+        print(self.last_position_m)
+        #print(f"ROTORCRAFT_FP from {ac_id}: {msg}", flush=True)
 
     @staticmethod
     def rotorcraft_position_m(msg) -> np.ndarray:
@@ -359,7 +464,13 @@ class Mapper:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Display grayscale images from mlx90640_stats ZeroMQ messages."
+        description="Display mapped grayscale images from MLX90640 frames."
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("ecal", "zmq"),
+        default="ecal",
+        help="Transport to use for receiving frames and telemetry",
     )
     parser.add_argument(
         "--connect",
@@ -367,16 +478,32 @@ def parse_args() -> argparse.Namespace:
         help=f"ZeroMQ PUB endpoint to connect to, default: {DEFAULT_ENDPOINT}",
     )
     parser.add_argument(
+        "--thermal-topic",
+        default=DEFAULT_ECAL_THERMAL_TOPIC,
+        help=f"eCAL ThermalData topic, default: {DEFAULT_ECAL_THERMAL_TOPIC}",
+    )
+    parser.add_argument(
+        "--pprz-topic",
+        default=DEFAULT_ECAL_PPRZ_TOPIC,
+        help=f"eCAL PprzMsg topic, default: {DEFAULT_ECAL_PPRZ_TOPIC}",
+    )
+    parser.add_argument(
         "--ivy-bus",
         default=None,
-        help="Ivy bus address and port. Defaults to the Paparazzi Ivy setting.",
+        help="Ivy bus address and port for --transport zmq. Defaults to Paparazzi Ivy.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    with Mapper(args.connect, args.ivy_bus) as mapper:
+    with Mapper(
+        args.connect,
+        args.ivy_bus,
+        args.transport,
+        args.thermal_topic,
+        args.pprz_topic,
+    ) as mapper:
         mapper.run()
 
 
