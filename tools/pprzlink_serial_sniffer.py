@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
 
@@ -29,6 +30,10 @@ from thermal_pb2 import PprzMsg
 
 
 ecal_rec: subprocess.Popen | None = None
+GPS_WEEK = timedelta(days=7)
+TIME_SYNC_THRESHOLD = timedelta(seconds=60)
+TIME_SYNC_RETRY_INTERVAL = timedelta(seconds=60)
+last_time_sync_attempt: datetime | None = None
 
 
 def resolve_message_name(class_id: int, msg_id: int) -> str:
@@ -89,6 +94,70 @@ def format_payload(payload: bytes) -> str:
     return payload.hex(" ")
 
 
+def infer_datetime_from_gps_tow(
+    tow_ms: int,
+    now: datetime | None = None,
+) -> datetime:
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    days_since_gps_week_start = (now.weekday() + 1) % 7
+    week_start = (now - timedelta(days=days_since_gps_week_start)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    current_week_date = week_start + timedelta(milliseconds=tow_ms)
+    candidates = (
+        current_week_date - GPS_WEEK,
+        current_week_date,
+        current_week_date + GPS_WEEK,
+    )
+    return min(candidates, key=lambda candidate: abs(candidate - now))
+
+
+def maybe_set_system_time_from_gps(gps_datetime: datetime, now: datetime) -> None:
+    global last_time_sync_attempt
+
+    drift = abs(gps_datetime - now)
+    gps_datetime_str = gps_datetime.isoformat().replace("+00:00", "Z")
+    if drift <= TIME_SYNC_THRESHOLD:
+        print(
+            f"GPS time sync not needed: date={gps_datetime_str} "
+            f"drift={drift.total_seconds():.3f}s",
+            flush=True,
+        )
+        return
+
+    if (
+        last_time_sync_attempt is not None
+        and now - last_time_sync_attempt < TIME_SYNC_RETRY_INTERVAL
+    ):
+        print(
+            f"GPS time sync skipped: date={gps_datetime_str} "
+            f"drift={drift.total_seconds():.3f}s retry_interval="
+            f"{TIME_SYNC_RETRY_INTERVAL.total_seconds():.0f}s",
+            flush=True,
+        )
+        return
+
+    last_time_sync_attempt = now
+    epoch_seconds = int(gps_datetime.timestamp())
+    print(
+        f"GPS time sync correcting system time: date={gps_datetime_str} "
+        f"drift={drift.total_seconds():.3f}s",
+        flush=True,
+    )
+    try:
+        subprocess.run(
+            ["sudo", "date", "-u", "-s", f"@{epoch_seconds}"],
+            check=False,
+        )
+    except OSError as exc:
+        print(f"GPS time sync failed to run sudo date: {exc}", file=sys.stderr, flush=True)
+
+
 def start_ecal_recording() -> None:
     global ecal_rec
 
@@ -138,6 +207,14 @@ def on_payload_command(
         print(pprz_message)
 
 
+def on_gps_int(pprz_message: PprzMessage) -> None:
+    now = datetime.now(timezone.utc)
+    gps_datetime = infer_datetime_from_gps_tow(pprz_message.tow, now)
+    gps_datetime_str = gps_datetime.isoformat().replace("+00:00", "Z")
+    print(f"GPS_INT tow={pprz_message.tow} date={gps_datetime_str}", flush=True)
+    maybe_set_system_time_from_gps(gps_datetime, now)
+
+
 def decode_pprz_message(class_id: int, msg_id: int, payload: bytes) -> PprzMessage:
     pprz_message = PprzMessage(class_id, msg_id)
     pprz_message.binary_to_payload(payload)
@@ -152,13 +229,17 @@ def dispatch_message(
     message_name: str,
     payload: bytes,
 ) -> None:
-    if message_name.rsplit(".", 1)[-1] == "PAYLOAD_COMMAND":
+    short_message_name = message_name.rsplit(".", 1)[-1]
+    if short_message_name in {"PAYLOAD_COMMAND", "GPS_INT"}:
         try:
             pprz_message = decode_pprz_message(class_id, msg_id, payload)
         except Exception as exc:
             print(f"Could not decode {message_name}: {exc}", file=sys.stderr, flush=True)
             return
 
+    if short_message_name == "GPS_INT":
+        on_gps_int(pprz_message)
+    elif short_message_name == "PAYLOAD_COMMAND":
         on_payload_command(
             source,
             destination,
