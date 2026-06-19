@@ -38,12 +38,14 @@ DEFAULT_ECAL_THERMAL_TOPIC = "mlx90640_data"
 DEFAULT_ECAL_PPRZ_TOPIC = "pprz_msg"
 MIN_IMAGE_VALUE = 0.0
 MAX_IMAGE_VALUE = 255.0
-DISPLAY_SCALE = 10
+DISPLAY_SCALE = 3
+INPUT_IMAGE_SCALE = 4
 WINDOW_NAME = "MLX90640 grayscale"
 MAP_WINDOW_NAME = "Thermal global map"
+HEADING_PREVIEW_WINDOW_NAME = "Heading image preview"
 IVY_APP_NAME = "ThermalMap"
 # in roll, pitch, yaw
-THERMAL_SENSOR_ROTATION_DEG = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+THERMAL_SENSOR_ROTATION_DEG = np.array([0.0, 0.0, -90], dtype=np.float32)
 THERMAL_SENSOR_HORIZONTAL_FOV_DEG = 55.0
 THERMAL_SENSOR_VERTICAL_FOV_DEG = 35.0
 GROUND_ALTITUDE_M = 0.0
@@ -54,10 +56,10 @@ AREA_XMAX = 45
 AREA_YMIN = -50
 AREA_YMAX = -10
 
-MIN_TEMPERATURE_C = 30
-MAX_TEMPERATURE_C = 60
+MIN_TEMPERATURE_C = 20
+MAX_TEMPERATURE_C = 35
 # meters per pixel
-AREA_RESOLUTION = 0.3
+AREA_RESOLUTION = 0.1
 MAP_BLEND_REPLACE = "replace"
 MAP_BLEND_WEIGHTED = "weighted"
 MAP_BLEND_MODE = MAP_BLEND_REPLACE
@@ -66,6 +68,7 @@ DRONE_MARKER_RADIUS_PX = 6
 DRONE_HEADING_LENGTH_M = 2.0
 DRONE_HEADING_THICKNESS_PX = 2
 PROJECTED_IMAGE_OUTLINE_THICKNESS_PX = 2
+PROJECTED_BLEND_MASK_ERODE_PX = 1
 TEMPERATURE_LABEL_ORIGIN_PX = (8, 22)
 DRONE_POSITION_BOUNDS_LABEL_ORIGIN_PX = (8, 44)
 THERMAL_PALETTE_RGB = (
@@ -285,8 +288,18 @@ class Mapper:
         temperatures = np.array(frame["temperatures"], dtype=np.float32).reshape(
             height, width
         )
+        temperatures = temperatures[:, ::-1]
         temperatures = np.nan_to_num(temperatures, nan=MIN_IMAGE_VALUE)
         temperatures = np.clip(temperatures, MIN_IMAGE_VALUE, MAX_IMAGE_VALUE)
+        if INPUT_IMAGE_SCALE > 1:
+            temperatures = cv2.resize(
+                temperatures,
+                None,
+                fx=INPUT_IMAGE_SCALE,
+                fy=INPUT_IMAGE_SCALE,
+                interpolation=cv2.INTER_CUBIC,
+            )
+            temperatures = np.clip(temperatures, MIN_IMAGE_VALUE, MAX_IMAGE_VALUE)
         return temperatures.astype(np.float32)
 
     def create_area_image(self) -> np.ndarray:
@@ -329,13 +342,22 @@ class Mapper:
             self.last_image,
             transform,
             (area_width, area_height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        source_footprint_mask = np.full((height, width), 255, dtype=np.uint8)
+        warped_footprint_mask = cv2.warpPerspective(
+            source_footprint_mask,
+            transform,
+            (area_width, area_height),
             flags=cv2.INTER_NEAREST,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
         )
-        source_mask = self.create_subpage_update_mask(height, width)
-        warped_mask = cv2.warpPerspective(
-            source_mask,
+        source_update_mask = self.create_subpage_update_mask(height, width)
+        warped_update_mask = cv2.warpPerspective(
+            source_update_mask,
             transform,
             (area_width, area_height),
             flags=cv2.INTER_NEAREST,
@@ -343,9 +365,21 @@ class Mapper:
             borderValue=0,
         )
 
-        valid_pixels = warped_mask > 0
+        valid_pixels = (
+            (self.erode_projected_mask(warped_footprint_mask) > 0)
+            & (warped_update_mask > 0)
+        )
         self.blend_area_image(warped_image, valid_pixels)
         return True
+
+    @staticmethod
+    def erode_projected_mask(mask: np.ndarray) -> np.ndarray:
+        if PROJECTED_BLEND_MASK_ERODE_PX <= 0:
+            return mask
+
+        kernel_size = 2 * PROJECTED_BLEND_MASK_ERODE_PX + 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        return cv2.erode(mask, kernel, iterations=1)
 
     def blend_area_image(self, new_image: np.ndarray, update_mask: np.ndarray) -> None:
         empty_pixels = update_mask & (self.area_image == 0)
@@ -367,6 +401,7 @@ class Mapper:
             raise ValueError(f"unknown map blend mode: {self.map_blend_mode}")
 
     def create_subpage_update_mask(self, height: int, width: int) -> np.ndarray:
+        #return np.full((height, width), 255, dtype=np.uint8)
         if self.last_subpage is None:
             return np.full((height, width), 255, dtype=np.uint8)
 
@@ -408,10 +443,10 @@ class Mapper:
         y = np.tan(half_vfov)
         rays_camera = np.array(
             [
-                [-x, -y, 1.0],
-                [x, -y, 1.0],
-                [x, y, 1.0],
                 [-x, y, 1.0],
+                [x, y, 1.0],
+                [x, -y, 1.0],
+                [-x, -y, 1.0],
             ],
             dtype=np.float32,
         )
@@ -526,6 +561,7 @@ class Mapper:
     def display_images(self) -> bool:
         if self.last_image is not None:
             self.display_scaled_image(WINDOW_NAME, self.last_image, DISPLAY_SCALE)
+            self.display_heading_preview()
         self.display_scaled_image(
             MAP_WINDOW_NAME,
             self.area_image,
@@ -690,6 +726,48 @@ class Mapper:
             cv2.LINE_AA,
             0,
             0.25,
+        )
+
+    def display_heading_preview(self) -> None:
+        if self.last_image is None or self.last_attitude_deg is None:
+            return
+
+        display_image, _ = self.scale_temperature_image_for_display(self.last_image)
+        scaled_image = cv2.resize(
+            display_image,
+            None,
+            fx=DISPLAY_SCALE,
+            fy=DISPLAY_SCALE,
+            interpolation=cv2.INTER_NEAREST,
+        )
+        preview_heading_deg = (
+            float(self.last_attitude_deg[2])
+            + float(self.thermal_sensor_rotation_deg[2])
+        )
+        rotated_image = self.rotate_image_by_heading(
+            scaled_image,
+            preview_heading_deg,
+        )
+        cv2.imshow(HEADING_PREVIEW_WINDOW_NAME, rotated_image)
+
+    @staticmethod
+    def rotate_image_by_heading(image: np.ndarray, heading_deg: float) -> np.ndarray:
+        height, width = image.shape[:2]
+        center = (width / 2.0, height / 2.0)
+        rotation = cv2.getRotationMatrix2D(center, -heading_deg, 1.0)
+        cos_angle = abs(rotation[0, 0])
+        sin_angle = abs(rotation[0, 1])
+        rotated_width = int((height * sin_angle) + (width * cos_angle))
+        rotated_height = int((height * cos_angle) + (width * sin_angle))
+        rotation[0, 2] += (rotated_width / 2.0) - center[0]
+        rotation[1, 2] += (rotated_height / 2.0) - center[1]
+        return cv2.warpAffine(
+            image,
+            rotation,
+            (rotated_width, rotated_height),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
         )
 
     def __enter__(self):
