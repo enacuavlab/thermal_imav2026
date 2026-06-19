@@ -200,7 +200,7 @@ class ThermalFrame(QtWidgets.QWidget):
             for col in range(self.width_px):
                 value = self.values[row * self.width_px + col]
                 color = self._color_for(value, low, high)
-                image.setPixelColor(col, row, color)
+                image.setPixelColor(self.width_px - 1 - col, row, color)
 
         painter.drawImage(frame_rect, image.scaled(
             frame_rect.size(),
