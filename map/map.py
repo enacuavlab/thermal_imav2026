@@ -17,6 +17,10 @@ import ecal.nanobind_core as ecal_core
 from ecal.msg.common.core import ReceiveCallbackData
 from ecal.msg.proto.core import Subscriber as ProtoSubscriber
 import numpy as np
+import rasterio
+from affine import Affine
+from pyproj import Geod, Transformer
+from rasterio.errors import RasterioIOError
 import zmq
 from scipy.spatial.transform import Rotation
 
@@ -56,14 +60,15 @@ AREA_XMAX = 45
 AREA_YMIN = -50
 AREA_YMAX = -10
 
-MIN_TEMPERATURE_C = 20
-MAX_TEMPERATURE_C = 35
+MIN_TEMPERATURE_C = 30
+MAX_TEMPERATURE_C = 60
 # meters per pixel
 AREA_RESOLUTION = 0.1
 MAP_BLEND_REPLACE = "replace"
 MAP_BLEND_WEIGHTED = "weighted"
 MAP_BLEND_MODE = MAP_BLEND_REPLACE
 MAP_BLEND_ALPHA = 0.4
+DEFAULT_HEAT_ALPHA = 0.55
 DRONE_MARKER_RADIUS_PX = 6
 DRONE_HEADING_LENGTH_M = 2.0
 DRONE_HEADING_THICKNESS_PX = 2
@@ -91,11 +96,15 @@ class Mapper:
         transport: str = "ecal",
         thermal_topic: str = DEFAULT_ECAL_THERMAL_TOPIC,
         pprz_topic: str = DEFAULT_ECAL_PPRZ_TOPIC,
+        geotiff_path: Path | None = None,
+        heat_alpha: float = DEFAULT_HEAT_ALPHA,
     ):
         self.endpoint = endpoint
         self.transport = transport
         self.thermal_topic = thermal_topic
         self.pprz_topic = pprz_topic
+        self.geotiff_path = geotiff_path
+        self.heat_alpha = heat_alpha
         self._closed = False
         self._owns_ecal = False
         self._latest_frame: dict | None = None
@@ -107,6 +116,9 @@ class Mapper:
         self.last_rotorcraft_fp = None
         self.last_position_m: np.ndarray | None = None
         self.last_attitude_deg: np.ndarray | None = None
+        self.last_gps_lat_deg: float | None = None
+        self.last_gps_lon_deg: float | None = None
+        self.last_gps_hmsl_m: float | None = None
         self.drone_position_min_east: float | None = None
         self.drone_position_max_east: float | None = None
         self.drone_position_min_north: float | None = None
@@ -114,11 +126,17 @@ class Mapper:
         self.last_image: np.ndarray | None = None
         self.last_subpage: int | None = None
         self.thermal_sensor_rotation_deg = THERMAL_SENSOR_ROTATION_DEG.copy()
+        self.satellite_image: np.ndarray | None = None
+        self.geotiff_transformer: Transformer | None = None
+        self.geotiff_inverse_transform: Affine | None = None
+        self.geod = Geod(ellps="WGS84")
         self.area_xmin = AREA_XMIN
         self.area_xmax = AREA_XMAX
         self.area_ymin = AREA_YMIN
         self.area_ymax = AREA_YMAX
         self.area_resolution = AREA_RESOLUTION
+        if self.geotiff_path is not None:
+            self.load_geotiff(self.geotiff_path)
         self.area_image = self.create_area_image()
         self.map_blend_mode = MAP_BLEND_MODE
         self.map_blend_alpha = MAP_BLEND_ALPHA
@@ -129,6 +147,70 @@ class Mapper:
             self._init_zmq(endpoint, ivy_bus)
         else:
             raise ValueError(f"unknown transport: {self.transport}")
+
+    @property
+    def geotiff_mode(self) -> bool:
+        return self.satellite_image is not None
+
+    def load_geotiff(self, geotiff_path: Path) -> None:
+        try:
+            dataset = rasterio.open(geotiff_path)
+        except RasterioIOError as exc:
+            raise RuntimeError(f"Could not open GeoTIFF: {geotiff_path}") from exc
+
+        with dataset:
+            if dataset.crs is None:
+                raise RuntimeError(f"GeoTIFF has no CRS/projection: {geotiff_path}")
+            if dataset.transform == Affine.identity():
+                raise RuntimeError(f"GeoTIFF has no geotransform: {geotiff_path}")
+
+            self.geotiff_transformer = Transformer.from_crs(
+                "EPSG:4326",
+                dataset.crs,
+                always_xy=True,
+            )
+            self.geotiff_inverse_transform = ~dataset.transform
+            self.satellite_image = self.read_geotiff_image(dataset)
+
+    @staticmethod
+    def read_geotiff_image(dataset) -> np.ndarray:
+        band_count = dataset.count
+        if band_count <= 0:
+            raise RuntimeError("GeoTIFF has no raster bands")
+
+        if band_count == 1:
+            band = Mapper.normalize_raster_band(dataset.read(1))
+            return cv2.cvtColor(band, cv2.COLOR_GRAY2BGR)
+
+        channels = [
+            Mapper.normalize_raster_band(dataset.read(index))
+            for index in range(1, min(3, band_count) + 1)
+        ]
+        while len(channels) < 3:
+            channels.append(channels[-1])
+        rgb = np.dstack(channels[:3])
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+    @staticmethod
+    def normalize_raster_band(band: np.ndarray) -> np.ndarray:
+        if band.dtype == np.uint8:
+            return band
+
+        band = band.astype(np.float32)
+        finite = band[np.isfinite(band)]
+        if finite.size == 0:
+            return np.zeros(band.shape, dtype=np.uint8)
+
+        low = float(np.percentile(finite, 2.0))
+        high = float(np.percentile(finite, 98.0))
+        if np.isclose(low, high):
+            low = float(np.min(finite))
+            high = float(np.max(finite))
+        if np.isclose(low, high):
+            return np.zeros(band.shape, dtype=np.uint8)
+
+        normalized = (band - low) / (high - low)
+        return (np.clip(normalized, 0.0, 1.0) * 255.0).astype(np.uint8)
 
     def _init_ecal(self) -> None:
         self._owns_ecal = not ecal_core.is_initialized()
@@ -154,6 +236,10 @@ class Mapper:
         self._interface.subscribe(
             self.on_rotorcraft_fp,
             pprz_message.PprzMessage("telemetry", "ROTORCRAFT_FP"),
+        )
+        self._interface.subscribe(
+            self.on_gps_int_ivy,
+            pprz_message.PprzMessage("telemetry", "GPS_INT"),
         )
 
     def run(self) -> None:
@@ -225,7 +311,8 @@ class Mapper:
     ) -> None:
         del pub_id
         pprz_msg = data.message
-        if pprz_msg.msg_name.rsplit(".", 1)[-1] != "ROTORCRAFT_FP":
+        message_name = pprz_msg.msg_name.rsplit(".", 1)[-1]
+        if message_name not in {"ROTORCRAFT_FP", "GPS_INT"}:
             return
 
         try:
@@ -235,7 +322,10 @@ class Mapper:
             print(f"Could not decode {pprz_msg.msg_name}: {exc}", file=sys.stderr, flush=True)
             return
 
-        self.on_rotorcraft_fp(pprz_msg.src, msg)
+        if message_name == "ROTORCRAFT_FP":
+            self.on_rotorcraft_fp(pprz_msg.src, msg)
+        elif message_name == "GPS_INT":
+            self.on_gps_int(msg)
 
     def on_rotorcraft_fp(self, ac_id, msg) -> None:
         self.last_rotorcraft_fp = msg
@@ -244,6 +334,15 @@ class Mapper:
         self.update_drone_position_bounds(self.last_position_m)
         print(self.last_position_m)
         #print(f"ROTORCRAFT_FP from {ac_id}: {msg}", flush=True)
+
+    def on_gps_int(self, msg) -> None:
+        self.last_gps_lat_deg = float(msg["lat"]) * 1e-7
+        self.last_gps_lon_deg = float(msg["lon"]) * 1e-7
+        self.last_gps_hmsl_m = float(msg["hmsl"]) * 0.001
+
+    def on_gps_int_ivy(self, ac_id, msg) -> None:
+        del ac_id
+        self.on_gps_int(msg)
 
     def update_drone_position_bounds(self, position_m: np.ndarray) -> None:
         east = float(position_m[0])
@@ -303,6 +402,10 @@ class Mapper:
         return temperatures.astype(np.float32)
 
     def create_area_image(self) -> np.ndarray:
+        if self.satellite_image is not None:
+            height, width = self.satellite_image.shape[:2]
+            return np.zeros((height, width), dtype=np.float32)
+
         if self.area_resolution <= 0:
             raise ValueError("area resolution must be positive")
 
@@ -410,21 +513,34 @@ class Mapper:
         return (updated_pixels * 255).astype(np.uint8)
 
     def projected_image_corners_px(self) -> np.ndarray | None:
-        ground_points = self.projected_image_corners_m()
-        if ground_points is None:
+        ground_offsets = self.projected_image_corner_offsets_m()
+        if ground_offsets is None:
             return None
 
-        destination_points = np.array(
-            [self.world_to_area_pixel(point[0], point[1]) for point in ground_points],
-            dtype=np.float32,
-        )
+        if self.geotiff_mode:
+            destination_points = np.array(
+                [
+                    self.gps_offset_to_area_pixel(offset[0], offset[1])
+                    for offset in ground_offsets
+                ],
+                dtype=np.float32,
+            )
+        else:
+            ground_points = self.last_position_m + ground_offsets
+            destination_points = np.array(
+                [
+                    self.world_to_area_pixel(point[0], point[1])
+                    for point in ground_points
+                ],
+                dtype=np.float32,
+            )
         if not np.all(np.isfinite(destination_points)):
             return None
         return destination_points
 
-    def projected_image_corners_m(self) -> np.ndarray | None:
+    def projected_image_corner_offsets_m(self) -> np.ndarray | None:
         rays_world = self.camera_corner_rays_world()
-        ground_points = []
+        ground_offsets = []
         for ray in rays_world:
             if ray[2] >= 0.0:
                 return None
@@ -432,9 +548,9 @@ class Mapper:
             scale = (GROUND_ALTITUDE_M - self.last_position_m[2]) / ray[2]
             if scale <= 0.0:
                 return None
-            ground_points.append(self.last_position_m + scale * ray)
+            ground_offsets.append(scale * ray)
 
-        return np.array(ground_points, dtype=np.float32)
+        return np.array(ground_offsets, dtype=np.float32)
 
     def camera_corner_rays_world(self) -> np.ndarray:
         half_hfov = np.deg2rad(THERMAL_SENSOR_HORIZONTAL_FOV_DEG) / 2.0
@@ -486,6 +602,56 @@ class Mapper:
     def world_to_area_pixel(self, east: float, north: float) -> tuple[float, float]:
         col = (east - self.area_xmin) / self.area_resolution
         row = (self.area_ymax - north) / self.area_resolution
+        return col, row
+
+    def current_drone_area_pixel(self) -> tuple[float, float] | None:
+        if self.geotiff_mode:
+            if self.last_gps_lat_deg is None or self.last_gps_lon_deg is None:
+                return None
+            return self.gps_to_area_pixel(
+                self.last_gps_lat_deg,
+                self.last_gps_lon_deg,
+            )
+
+        if self.last_position_m is None:
+            return None
+        return self.world_to_area_pixel(
+            float(self.last_position_m[0]),
+            float(self.last_position_m[1]),
+        )
+
+    def gps_offset_to_area_pixel(
+        self,
+        east_m: float,
+        north_m: float,
+    ) -> tuple[float, float]:
+        if (
+            self.last_gps_lat_deg is None
+            or self.last_gps_lon_deg is None
+            or self.geotiff_transformer is None
+            or self.geotiff_inverse_transform is None
+        ):
+            return np.nan, np.nan
+
+        distance_m = float(np.hypot(east_m, north_m))
+        if distance_m == 0.0:
+            return self.gps_to_area_pixel(self.last_gps_lat_deg, self.last_gps_lon_deg)
+
+        azimuth_deg = float(np.degrees(np.arctan2(east_m, north_m)))
+        lon, lat, _ = self.geod.fwd(
+            self.last_gps_lon_deg,
+            self.last_gps_lat_deg,
+            azimuth_deg,
+            distance_m,
+        )
+        return self.gps_to_area_pixel(lat, lon)
+
+    def gps_to_area_pixel(self, lat_deg: float, lon_deg: float) -> tuple[float, float]:
+        if self.geotiff_transformer is None or self.geotiff_inverse_transform is None:
+            return np.nan, np.nan
+
+        x, y = self.geotiff_transformer.transform(lon_deg, lat_deg)
+        col, row = self.geotiff_inverse_transform * (x, y)
         return col, row
 
     def projected_bounds_intersect_area(self, points: np.ndarray) -> bool:
@@ -562,14 +728,46 @@ class Mapper:
         if self.last_image is not None:
             self.display_scaled_image(WINDOW_NAME, self.last_image, DISPLAY_SCALE)
             self.display_heading_preview()
-        self.display_scaled_image(
-            MAP_WINDOW_NAME,
-            self.area_image,
-            DISPLAY_SCALE,
-            draw_drone=True,
-            draw_temperature_label=True,
-        )
+        self.display_global_map()
         return cv2.waitKey(1) == ord("q")
+
+    def display_global_map(self) -> None:
+        if self.satellite_image is None:
+            self.display_scaled_image(
+                MAP_WINDOW_NAME,
+                self.area_image,
+                DISPLAY_SCALE,
+                draw_drone=True,
+                draw_temperature_label=True,
+            )
+            return
+
+        heat_image, _ = self.scale_temperature_image_for_display(self.area_image)
+        valid_heat = self.area_image > 0
+        map_image = self.satellite_image.copy()
+        if np.any(valid_heat):
+            heat_alpha = max(0.0, min(1.0, self.heat_alpha))
+            satellite_alpha = 1.0 - heat_alpha
+            blended = (
+                satellite_alpha * map_image[valid_heat].astype(np.float32)
+                + heat_alpha * heat_image[valid_heat].astype(np.float32)
+            )
+            map_image[valid_heat] = np.clip(blended, 0, 255).astype(np.uint8)
+
+        scaled_image = cv2.resize(
+            map_image,
+            None,
+            fx=DISPLAY_SCALE,
+            fy=DISPLAY_SCALE,
+            interpolation=cv2.INTER_AREA,
+        )
+        self.draw_projected_image_shape(scaled_image, DISPLAY_SCALE)
+        self.draw_drone_position(scaled_image, DISPLAY_SCALE)
+        self.draw_drone_position_bounds_label(scaled_image)
+        data_bounds = self.temperature_data_bounds(self.area_image)
+        if data_bounds is not None:
+            self.draw_temperature_label(scaled_image, data_bounds)
+        cv2.imshow(MAP_WINDOW_NAME, scaled_image)
 
     def display_scaled_image(
         self,
@@ -675,13 +873,11 @@ class Mapper:
         )
 
     def draw_drone_position(self, image: np.ndarray, scale: int) -> None:
-        if self.last_position_m is None:
+        position = self.current_drone_area_pixel()
+        if position is None:
             return
 
-        col, row = self.world_to_area_pixel(
-            float(self.last_position_m[0]),
-            float(self.last_position_m[1]),
-        )
+        col, row = position
         height, width = self.area_image.shape
         if col < 0.0 or col >= width or row < 0.0 or row >= height:
             return
@@ -702,11 +898,22 @@ class Mapper:
             return
 
         heading_rad = np.deg2rad(float(self.last_attitude_deg[2]))
-        length_px = DRONE_HEADING_LENGTH_M / self.area_resolution * scale
-        end = (
-            int(round(center[0] + np.sin(heading_rad) * length_px)),
-            int(round(center[1] - np.cos(heading_rad) * length_px)),
-        )
+        if self.geotiff_mode:
+            east_m = np.sin(heading_rad) * DRONE_HEADING_LENGTH_M
+            north_m = np.cos(heading_rad) * DRONE_HEADING_LENGTH_M
+            end_col, end_row = self.gps_offset_to_area_pixel(east_m, north_m)
+            if not np.isfinite(end_col) or not np.isfinite(end_row):
+                return
+            end = (
+                int(round(end_col * scale)),
+                int(round(end_row * scale)),
+            )
+        else:
+            length_px = DRONE_HEADING_LENGTH_M / self.area_resolution * scale
+            end = (
+                int(round(center[0] + np.sin(heading_rad) * length_px)),
+                int(round(center[1] - np.cos(heading_rad) * length_px)),
+            )
         cv2.arrowedLine(
             image,
             center,
@@ -804,6 +1011,17 @@ def parse_args() -> argparse.Namespace:
         help=f"eCAL PprzMsg topic, default: {DEFAULT_ECAL_PPRZ_TOPIC}",
     )
     parser.add_argument(
+        "--geotiff",
+        type=Path,
+        help="optional georeferenced satellite/orthophoto GeoTIFF background",
+    )
+    parser.add_argument(
+        "--heat-alpha",
+        type=float,
+        default=DEFAULT_HEAT_ALPHA,
+        help=f"thermal overlay alpha over GeoTIFF, default: {DEFAULT_HEAT_ALPHA}",
+    )
+    parser.add_argument(
         "--ivy-bus",
         default=None,
         help="Ivy bus address and port for --transport zmq. Defaults to Paparazzi Ivy.",
@@ -813,13 +1031,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    with Mapper(
-        args.connect,
-        args.ivy_bus,
-        args.transport,
-        args.thermal_topic,
-        args.pprz_topic,
-    ) as mapper:
+    try:
+        mapper = Mapper(
+            args.connect,
+            args.ivy_bus,
+            args.transport,
+            args.thermal_topic,
+            args.pprz_topic,
+            args.geotiff,
+            args.heat_alpha,
+        )
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    with mapper:
         mapper.run()
 
 
