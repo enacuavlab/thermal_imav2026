@@ -1,0 +1,21 @@
+[Unit]
+Description=Thermal spotter
+Wants=network-online.target
+After=network.target network-online.target
+
+[Service]
+Type=simple
+ 
+
+WorkingDirectory=/home/pprz/thermal/sw
+ExecStartPre=/bin/sleep 10
+ExecStart=/home/pprz/termenv/bin/python3 /home/pprz/thermal/sw/thermal_spotter.py --threshold 40 --spot-kind cold
+ 
+Restart=on-failure
+RestartSec=2 
+# Configures the time to wait before service is stopped forcefully.
+TimeoutStopSec=300
+ 
+[Install]
+WantedBy=default.target
+

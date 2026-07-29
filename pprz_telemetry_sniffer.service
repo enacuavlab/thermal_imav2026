@@ -7,9 +7,9 @@ After=network.target network-online.target
 Type=simple
  
 
-WorkingDirectory=/home/pprz/thermal/tools
+WorkingDirectory=/home/pprz/thermal/sw
 ExecStartPre=/bin/sleep 10
-ExecStart=/home/pprz/termenv/bin/python3 /home/pprz/thermal/tools/pprzlink_serial_sniffer.py /dev/ttyS3 -b 115200
+ExecStart=/home/pprz/termenv/bin/python3 /home/pprz/thermal/sw/pprzlink_serial_sniffer.py /dev/ttyS3 -b 115200
  
 Restart=on-failure
 RestartSec=2 

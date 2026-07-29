@@ -1,45 +1,22 @@
 #!/usr/bin/env python3
 
-"""Subscribe to MLX90640 stats frames and display grayscale images."""
+"""Optional thermal-map display for :mod:`thermal_spotter`."""
 
 from __future__ import annotations
 
-import argparse
-import json
-import sys
-import threading
-import time
-from os import getenv, path
 from pathlib import Path
 
 import cv2
-import ecal.nanobind_core as ecal_core
-from ecal.msg.common.core import ReceiveCallbackData
-from ecal.msg.proto.core import Subscriber as ProtoSubscriber
 import numpy as np
 import rasterio
 from affine import Affine
 from pyproj import Geod, Transformer
 from rasterio.errors import RasterioIOError
-import zmq
-from scipy.spatial.transform import Rotation
-
-GENERATED_DIR = Path(__file__).resolve().parent.parent / "generated"
-sys.path.append(str(GENERATED_DIR))
-
-from thermal_pb2 import PprzMsg, ThermalData
-
-PPRZ_HOME = getenv("PAPARAZZI_HOME", "/home/fabien/paparazzi")
-pprz_python_path = path.join(PPRZ_HOME, "var/lib/python")
-sys.path.append(pprz_python_path)
-
-import pprzlink.message as pprz_message
-from pprzlink.ivy import IvyMessagesInterface
-
-
-DEFAULT_ENDPOINT = "tcp://127.0.0.1:5555"
-DEFAULT_ECAL_THERMAL_TOPIC = "mlx90640_data"
-DEFAULT_ECAL_PPRZ_TOPIC = "pprz_msg"
+from thermal_common import (
+    THERMAL_SENSOR_ROTATION_DEG,
+    ThermalCameraModel,
+    projected_image_corner_offsets_m,
+)
 MIN_IMAGE_VALUE = 0.0
 MAX_IMAGE_VALUE = 255.0
 DISPLAY_SCALE = 3
@@ -47,14 +24,6 @@ INPUT_IMAGE_SCALE = 4
 WINDOW_NAME = "MLX90640 grayscale"
 MAP_WINDOW_NAME = "Thermal global map"
 HEADING_PREVIEW_WINDOW_NAME = "Heading image preview"
-IVY_APP_NAME = "ThermalMap"
-# in roll, pitch, yaw
-THERMAL_SENSOR_ROTATION_DEG = np.array([0.0, 0.0, -90], dtype=np.float32)
-THERMAL_SENSOR_HORIZONTAL_FOV_DEG = 55.0
-THERMAL_SENSOR_VERTICAL_FOV_DEG = 35.0
-GROUND_ALTITUDE_M = 0.0
-ROTORCRAFT_FP_POS_SCALE = 0.0039063
-ROTORCRAFT_FP_ATTITUDE_SCALE_DEG = 0.0139882
 AREA_XMIN = 10
 AREA_XMAX = 45
 AREA_YMIN = -50
@@ -62,6 +31,8 @@ AREA_YMAX = -10
 
 MIN_TEMPERATURE_C = 30
 MAX_TEMPERATURE_C = 60
+TEMPERATURE_SLIDER_MAX_C = 120.0
+TEMPERATURE_SLIDER_STEP_C = 0.1
 # meters per pixel
 AREA_RESOLUTION = 0.1
 MAP_BLEND_REPLACE = "replace"
@@ -70,6 +41,12 @@ MAP_BLEND_MODE = MAP_BLEND_REPLACE
 MAP_BLEND_ALPHA = 0.4
 DEFAULT_HEAT_ALPHA = 0.55
 DRONE_MARKER_RADIUS_PX = 6
+HOT_SPOT_MARKER_RADIUS_PX = 7
+HOT_SPOT_MARKER_COLOR = (255, 0, 255)
+CLUSTER_MARKER_RADIUS_PX = 9
+CLUSTER_MARKER_COLOR = (48, 220, 48)
+MAP_CONTROL_MARGIN_PX = 8
+MAP_CONTROL_ROW_HEIGHT_PX = 24
 DRONE_HEADING_LENGTH_M = 2.0
 DRONE_HEADING_THICKNESS_PX = 2
 PROJECTED_IMAGE_OUTLINE_THICKNESS_PX = 2
@@ -86,34 +63,19 @@ THERMAL_PALETTE_RGB = (
 )
 
 
-class Mapper:
-    """Receive thermal frames and Paparazzi telemetry for mapping."""
+class ThermalMap:
+    """Render thermal frames and aircraft state supplied by ThermalSpotter."""
 
     def __init__(
         self,
-        endpoint: str = DEFAULT_ENDPOINT,
-        ivy_bus: str | None = None,
-        transport: str = "ecal",
-        thermal_topic: str = DEFAULT_ECAL_THERMAL_TOPIC,
-        pprz_topic: str = DEFAULT_ECAL_PPRZ_TOPIC,
+        ground_altitude_m: float,
         geotiff_path: Path | None = None,
         heat_alpha: float = DEFAULT_HEAT_ALPHA,
     ):
-        self.endpoint = endpoint
-        self.transport = transport
-        self.thermal_topic = thermal_topic
-        self.pprz_topic = pprz_topic
+        self.ground_altitude_m = ground_altitude_m
         self.geotiff_path = geotiff_path
         self.heat_alpha = heat_alpha
         self._closed = False
-        self._owns_ecal = False
-        self._latest_frame: dict | None = None
-        self._lock = threading.Lock()
-        self._thermal_subscriber = None
-        self._pprz_subscriber = None
-        self._interface = None
-        self.socket = None
-        self.last_rotorcraft_fp = None
         self.last_position_m: np.ndarray | None = None
         self.last_attitude_deg: np.ndarray | None = None
         self.last_gps_lat_deg: float | None = None
@@ -125,7 +87,16 @@ class Mapper:
         self.drone_position_max_north: float | None = None
         self.last_image: np.ndarray | None = None
         self.last_subpage: int | None = None
+        self.hot_spots = []
+        self.spot_clusters = []
+        self.show_spots = True
+        self.show_clusters = True
+        self.map_control_hitboxes: dict[str, tuple[int, int, int, int]] = {}
         self.thermal_sensor_rotation_deg = THERMAL_SENSOR_ROTATION_DEG.copy()
+        self.camera_model = ThermalCameraModel(self.thermal_sensor_rotation_deg)
+        self.temperature_min_c = float(MIN_TEMPERATURE_C)
+        self.temperature_max_c = float(MAX_TEMPERATURE_C)
+        self.temperature_sliders_ready = False
         self.satellite_image: np.ndarray | None = None
         self.geotiff_transformer: Transformer | None = None
         self.geotiff_inverse_transform: Affine | None = None
@@ -140,13 +111,6 @@ class Mapper:
         self.area_image = self.create_area_image()
         self.map_blend_mode = MAP_BLEND_MODE
         self.map_blend_alpha = MAP_BLEND_ALPHA
-
-        if self.transport == "ecal":
-            self._init_ecal()
-        elif self.transport == "zmq":
-            self._init_zmq(endpoint, ivy_bus)
-        else:
-            raise ValueError(f"unknown transport: {self.transport}")
 
     @property
     def geotiff_mode(self) -> bool:
@@ -179,11 +143,11 @@ class Mapper:
             raise RuntimeError("GeoTIFF has no raster bands")
 
         if band_count == 1:
-            band = Mapper.normalize_raster_band(dataset.read(1))
+            band = ThermalMap.normalize_raster_band(dataset.read(1))
             return cv2.cvtColor(band, cv2.COLOR_GRAY2BGR)
 
         channels = [
-            Mapper.normalize_raster_band(dataset.read(index))
+            ThermalMap.normalize_raster_band(dataset.read(index))
             for index in range(1, min(3, band_count) + 1)
         ]
         while len(channels) < 3:
@@ -212,137 +176,38 @@ class Mapper:
         normalized = (band - low) / (high - low)
         return (np.clip(normalized, 0.0, 1.0) * 255.0).astype(np.uint8)
 
-    def _init_ecal(self) -> None:
-        self._owns_ecal = not ecal_core.is_initialized()
-        if self._owns_ecal:
-            ecal_core.initialize("Thermal Map")
-
-        self._thermal_subscriber = ProtoSubscriber(ThermalData, self.thermal_topic)
-        self._thermal_subscriber.set_receive_callback(self._on_thermal_receive)
-        self._pprz_subscriber = ProtoSubscriber(PprzMsg, self.pprz_topic)
-        self._pprz_subscriber.set_receive_callback(self._on_pprz_receive)
-
-    def _init_zmq(self, endpoint: str, ivy_bus: str | None) -> None:
-        self.context = zmq.Context.instance()
-        self.socket = self.context.socket(zmq.SUB)
-        self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.connect(endpoint)
-
-        if ivy_bus is None:
-            self._interface = IvyMessagesInterface(IVY_APP_NAME)
-        else:
-            self._interface = IvyMessagesInterface(IVY_APP_NAME, ivy_bus=ivy_bus)
-        self._interface.subscribe(
-            self.on_rotorcraft_fp,
-            pprz_message.PprzMessage("telemetry", "ROTORCRAFT_FP"),
-        )
-        self._interface.subscribe(
-            self.on_gps_int_ivy,
-            pprz_message.PprzMessage("telemetry", "GPS_INT"),
-        )
-
-    def run(self) -> None:
-        try:
-            while True:
-                frame = self.receive_frame()
-                if frame is not None:
-                    image = self.create_grayscale_image(frame)
-                    self.last_image = image
-                    self.last_subpage = int(frame["subpage"])
-                    self.project_last_image_to_area()
-                    # print(frame, flush=True)
-                if self.display_images():
-                    break
-                if self.transport == "ecal" and frame is None:
-                    time.sleep(0.01)
-        finally:
-            self.close()
-
     def close(self) -> None:
         if self._closed:
             return
 
         self._closed = True
-        if self.socket is not None:
-            self.socket.close(0)
-        if self._interface is not None:
-            print("Shutting down ivy interface...")
-            self._interface.shutdown()
-        if self._thermal_subscriber is not None:
-            self._thermal_subscriber.remove_receive_callback()
-        if self._pprz_subscriber is not None:
-            self._pprz_subscriber.remove_receive_callback()
-        if self._owns_ecal and ecal_core.is_initialized():
-            ecal_core.finalize()
         cv2.destroyAllWindows()
 
-    def receive_frame(self) -> dict | None:
-        if self.transport == "ecal":
-            with self._lock:
-                latest = self._latest_frame
-                self._latest_frame = None
-            return latest
-
-        message = self.socket.recv_string()
-        return json.loads(message)
-
-    def _on_thermal_receive(
+    def update_aircraft_state(
         self,
-        pub_id: ecal_core.TopicId,
-        data: ReceiveCallbackData[ThermalData],
+        position_m: np.ndarray,
+        attitude_deg: np.ndarray,
     ) -> None:
-        del pub_id
-        with self._lock:
-            self._latest_frame = self._thermal_to_frame(data.message)
+        self.last_position_m = position_m.copy()
+        self.last_attitude_deg = attitude_deg.copy()
+        self.update_drone_position_bounds(position_m)
 
-    def _thermal_to_frame(self, thermal_data: ThermalData) -> dict:
-        return {
-            "subpage": thermal_data.subpage,
-            "width": thermal_data.cols,
-            "height": thermal_data.rows,
-            "temperatures": list(thermal_data.data),
-        }
+    def update_gps(self, latitude_deg: float, longitude_deg: float, hmsl_m: float) -> None:
+        self.last_gps_lat_deg = latitude_deg
+        self.last_gps_lon_deg = longitude_deg
+        self.last_gps_hmsl_m = hmsl_m
 
-    def _on_pprz_receive(
-        self,
-        pub_id: ecal_core.TopicId,
-        data: ReceiveCallbackData[PprzMsg],
-    ) -> None:
-        del pub_id
-        pprz_msg = data.message
-        message_name = pprz_msg.msg_name.rsplit(".", 1)[-1]
-        if message_name not in {"ROTORCRAFT_FP", "GPS_INT"}:
-            return
+    def process_frame(self, frame: dict) -> None:
+        self.last_image = self.create_grayscale_image(frame)
+        self.last_subpage = int(frame["subpage"])
+        self.project_last_image_to_area()
 
-        try:
-            msg = pprz_message.PprzMessage(pprz_msg.msg_class, pprz_msg.msg_id)
-            msg.binary_to_payload(bytes(pprz_msg.payload))
-        except Exception as exc:
-            print(f"Could not decode {pprz_msg.msg_name}: {exc}", file=sys.stderr, flush=True)
-            return
+    def mark_hot_spot(self, hot_spot) -> None:
+        """Keep a detected ground point visible as new thermal frames arrive."""
+        self.hot_spots.append(hot_spot)
 
-        if message_name == "ROTORCRAFT_FP":
-            self.on_rotorcraft_fp(pprz_msg.src, msg)
-        elif message_name == "GPS_INT":
-            self.on_gps_int(msg)
-
-    def on_rotorcraft_fp(self, ac_id, msg) -> None:
-        self.last_rotorcraft_fp = msg
-        self.last_position_m = self.rotorcraft_position_m(msg)
-        self.last_attitude_deg = self.rotorcraft_attitude_deg(msg)
-        self.update_drone_position_bounds(self.last_position_m)
-        print(self.last_position_m)
-        #print(f"ROTORCRAFT_FP from {ac_id}: {msg}", flush=True)
-
-    def on_gps_int(self, msg) -> None:
-        self.last_gps_lat_deg = float(msg["lat"]) * 1e-7
-        self.last_gps_lon_deg = float(msg["lon"]) * 1e-7
-        self.last_gps_hmsl_m = float(msg["hmsl"]) * 0.001
-
-    def on_gps_int_ivy(self, ac_id, msg) -> None:
-        del ac_id
-        self.on_gps_int(msg)
+    def update_spot_clusters(self, spot_clusters) -> None:
+        self.spot_clusters = list(spot_clusters)
 
     def update_drone_position_bounds(self, position_m: np.ndarray) -> None:
         east = float(position_m[0])
@@ -358,28 +223,6 @@ class Mapper:
         self.drone_position_max_east = max(self.drone_position_max_east, east)
         self.drone_position_min_north = min(self.drone_position_min_north, north)
         self.drone_position_max_north = max(self.drone_position_max_north, north)
-
-    @staticmethod
-    def rotorcraft_position_m(msg) -> np.ndarray:
-        return np.array(
-            [
-                float(msg["east"]) * ROTORCRAFT_FP_POS_SCALE,
-                float(msg["north"]) * ROTORCRAFT_FP_POS_SCALE,
-                float(msg["up"]) * ROTORCRAFT_FP_POS_SCALE,
-            ],
-            dtype=np.float32,
-        )
-
-    @staticmethod
-    def rotorcraft_attitude_deg(msg) -> np.ndarray:
-        return np.array(
-            [
-                float(msg["phi"]) * ROTORCRAFT_FP_ATTITUDE_SCALE_DEG,
-                float(msg["theta"]) * ROTORCRAFT_FP_ATTITUDE_SCALE_DEG,
-                float(msg["psi"]) * ROTORCRAFT_FP_ATTITUDE_SCALE_DEG,
-            ],
-            dtype=np.float32,
-        )
 
     def create_grayscale_image(self, frame: dict) -> np.ndarray:
         width = int(frame["width"])
@@ -539,65 +382,12 @@ class Mapper:
         return destination_points
 
     def projected_image_corner_offsets_m(self) -> np.ndarray | None:
-        rays_world = self.camera_corner_rays_world()
-        ground_offsets = []
-        for ray in rays_world:
-            if ray[2] >= 0.0:
-                return None
-
-            scale = (GROUND_ALTITUDE_M - self.last_position_m[2]) / ray[2]
-            if scale <= 0.0:
-                return None
-            ground_offsets.append(scale * ray)
-
-        return np.array(ground_offsets, dtype=np.float32)
-
-    def camera_corner_rays_world(self) -> np.ndarray:
-        half_hfov = np.deg2rad(THERMAL_SENSOR_HORIZONTAL_FOV_DEG) / 2.0
-        half_vfov = np.deg2rad(THERMAL_SENSOR_VERTICAL_FOV_DEG) / 2.0
-        x = np.tan(half_hfov)
-        y = np.tan(half_vfov)
-        rays_camera = np.array(
-            [
-                [-x, y, 1.0],
-                [x, y, 1.0],
-                [x, -y, 1.0],
-                [-x, -y, 1.0],
-            ],
-            dtype=np.float32,
+        return projected_image_corner_offsets_m(
+            self.camera_model,
+            self.last_position_m,
+            self.last_attitude_deg,
+            self.ground_altitude_m,
         )
-        rays_camera /= np.linalg.norm(rays_camera, axis=1, keepdims=True)
-
-        camera_to_body = np.array(
-            [
-                [0.0, 1.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        )
-        body_to_world_level = np.array(
-            [
-                [0.0, 1.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [0.0, 0.0, -1.0],
-            ],
-            dtype=np.float32,
-        )
-
-        mount_rotation = Rotation.from_euler(
-            "xyz", self.thermal_sensor_rotation_deg, degrees=True
-        ).as_matrix()
-        attitude_rotation = Rotation.from_euler(
-            "xyz", self.last_attitude_deg, degrees=True
-        ).as_matrix()
-        camera_to_world = (
-            body_to_world_level
-            @ attitude_rotation
-            @ mount_rotation
-            @ camera_to_body
-        )
-        return (camera_to_world @ rays_camera.T).T
 
     def world_to_area_pixel(self, east: float, north: float) -> tuple[float, float]:
         col = (east - self.area_xmin) / self.area_resolution
@@ -668,19 +458,62 @@ class Mapper:
         )
 
     def temperature_scale_bounds(self, image: np.ndarray) -> tuple[float, float] | None:
-        if MIN_TEMPERATURE_C == 0 and MAX_TEMPERATURE_C == 0:
+        if self.temperature_min_c == 0 and self.temperature_max_c == 0:
             bounds = self.temperature_data_bounds(image)
             if bounds is None:
                 return None
             low, high = bounds
         else:
-            low = float(MIN_TEMPERATURE_C)
-            high = float(MAX_TEMPERATURE_C)
+            low = self.temperature_min_c
+            high = self.temperature_max_c
 
         if np.isclose(low, high):
             low -= 1.0
             high += 1.0
+        elif low > high:
+            low, high = high, low
         return low, high
+
+    def setup_temperature_sliders(self) -> None:
+        if self.temperature_sliders_ready:
+            return
+
+        cv2.namedWindow(MAP_WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+        cv2.createTrackbar(
+            "min C x10",
+            MAP_WINDOW_NAME,
+            self.temperature_to_slider_position(self.temperature_min_c),
+            self.temperature_slider_max_position(),
+            self.on_temperature_min_slider,
+        )
+        cv2.createTrackbar(
+            "max C x10",
+            MAP_WINDOW_NAME,
+            self.temperature_to_slider_position(self.temperature_max_c),
+            self.temperature_slider_max_position(),
+            self.on_temperature_max_slider,
+        )
+        cv2.setMouseCallback(MAP_WINDOW_NAME, self.on_map_mouse)
+        self.temperature_sliders_ready = True
+
+    def on_temperature_min_slider(self, position: int) -> None:
+        self.temperature_min_c = self.slider_position_to_temperature(position)
+
+    def on_temperature_max_slider(self, position: int) -> None:
+        self.temperature_max_c = self.slider_position_to_temperature(position)
+
+    @staticmethod
+    def temperature_slider_max_position() -> int:
+        return int(round(TEMPERATURE_SLIDER_MAX_C / TEMPERATURE_SLIDER_STEP_C))
+
+    @staticmethod
+    def temperature_to_slider_position(temperature_c: float) -> int:
+        clamped = float(np.clip(temperature_c, 0.0, TEMPERATURE_SLIDER_MAX_C))
+        return int(round(clamped / TEMPERATURE_SLIDER_STEP_C))
+
+    @staticmethod
+    def slider_position_to_temperature(position: int) -> float:
+        return position * TEMPERATURE_SLIDER_STEP_C
 
     @staticmethod
     def temperature_data_bounds(image: np.ndarray) -> tuple[float, float] | None:
@@ -725,6 +558,7 @@ class Mapper:
         return color_image
 
     def display_images(self) -> bool:
+        self.setup_temperature_sliders()
         if self.last_image is not None:
             self.display_scaled_image(WINDOW_NAME, self.last_image, DISPLAY_SCALE)
             self.display_heading_preview()
@@ -762,11 +596,16 @@ class Mapper:
             interpolation=cv2.INTER_AREA,
         )
         self.draw_projected_image_shape(scaled_image, DISPLAY_SCALE)
+        if self.show_spots:
+            self.draw_hot_spots(scaled_image, DISPLAY_SCALE)
+        if self.show_clusters:
+            self.draw_spot_clusters(scaled_image, DISPLAY_SCALE)
         self.draw_drone_position(scaled_image, DISPLAY_SCALE)
         self.draw_drone_position_bounds_label(scaled_image)
         data_bounds = self.temperature_data_bounds(self.area_image)
         if data_bounds is not None:
             self.draw_temperature_label(scaled_image, data_bounds)
+        self.draw_map_controls(scaled_image)
         cv2.imshow(MAP_WINDOW_NAME, scaled_image)
 
     def display_scaled_image(
@@ -787,13 +626,84 @@ class Mapper:
         )
         if draw_drone:
             self.draw_projected_image_shape(scaled_image, scale)
+            if self.show_spots:
+                self.draw_hot_spots(scaled_image, scale)
+            if self.show_clusters:
+                self.draw_spot_clusters(scaled_image, scale)
             self.draw_drone_position(scaled_image, scale)
             self.draw_drone_position_bounds_label(scaled_image)
         if draw_temperature_label:
             data_bounds = self.temperature_data_bounds(image)
             if data_bounds is not None:
                 self.draw_temperature_label(scaled_image, data_bounds)
+        if draw_drone:
+            self.draw_map_controls(scaled_image)
         cv2.imshow(window_name, scaled_image)
+
+    def draw_map_controls(self, image: np.ndarray) -> None:
+        controls = (
+            ("spots", "Spots", self.show_spots),
+            ("clusters", "Clusters", self.show_clusters),
+        )
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        label_width = max(
+            cv2.getTextSize(label, font, font_scale, thickness)[0][0]
+            for _, label, _ in controls
+        )
+        control_width = label_width + 32
+        origin_x = max(
+            MAP_CONTROL_MARGIN_PX,
+            image.shape[1] - control_width - MAP_CONTROL_MARGIN_PX,
+        )
+        self.map_control_hitboxes.clear()
+
+        for index, (name, label, checked) in enumerate(controls):
+            top = MAP_CONTROL_MARGIN_PX + index * MAP_CONTROL_ROW_HEIGHT_PX
+            bottom = top + MAP_CONTROL_ROW_HEIGHT_PX - 2
+            cv2.rectangle(
+                image,
+                (origin_x - 4, top - 2),
+                (origin_x + control_width, bottom),
+                (0, 0, 0),
+                -1,
+            )
+            checkbox_top_left = (origin_x, top + 3)
+            checkbox_bottom_right = (origin_x + 14, top + 17)
+            cv2.rectangle(image, checkbox_top_left, checkbox_bottom_right, (255, 255, 255), 1)
+            if checked:
+                cv2.line(image, (origin_x + 3, top + 10), (origin_x + 6, top + 14), (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.line(image, (origin_x + 6, top + 14), (origin_x + 12, top + 6), (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(
+                image,
+                label,
+                (origin_x + 20, top + 15),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA,
+            )
+            self.map_control_hitboxes[name] = (
+                origin_x - 4,
+                top - 2,
+                origin_x + control_width,
+                bottom,
+            )
+
+    def on_map_mouse(self, event, x: int, y: int, flags, param) -> None:
+        del flags, param
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+
+        for name, (left, top, right, bottom) in self.map_control_hitboxes.items():
+            if left <= x <= right and top <= y <= bottom:
+                if name == "spots":
+                    self.show_spots = not self.show_spots
+                elif name == "clusters":
+                    self.show_clusters = not self.show_clusters
+                return
 
     def draw_drone_position_bounds_label(self, image: np.ndarray) -> None:
         if self.drone_position_min_east is None:
@@ -871,6 +781,89 @@ class Mapper:
             thickness=PROJECTED_IMAGE_OUTLINE_THICKNESS_PX,
             lineType=cv2.LINE_AA,
         )
+
+    def draw_hot_spots(self, image: np.ndarray, scale: int) -> None:
+        for hot_spot in self.hot_spots:
+            position = self.hot_spot_area_pixel(hot_spot)
+            if position is None:
+                continue
+
+            col, row = position
+            height, width = self.area_image.shape
+            if col < 0.0 or col >= width or row < 0.0 or row >= height:
+                continue
+
+            center = (int(round(col * scale)), int(round(row * scale)))
+            cv2.drawMarker(
+                image,
+                center,
+                (0, 0, 0),
+                cv2.MARKER_TILTED_CROSS,
+                HOT_SPOT_MARKER_RADIUS_PX * 2 + 4,
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.drawMarker(
+                image,
+                center,
+                HOT_SPOT_MARKER_COLOR,
+                cv2.MARKER_TILTED_CROSS,
+                HOT_SPOT_MARKER_RADIUS_PX * 2,
+                1,
+                cv2.LINE_AA,
+            )
+            self.draw_label(
+                image,
+                f"#{hot_spot.sequence} {hot_spot.temperature:.1f} C",
+                (center[0] + HOT_SPOT_MARKER_RADIUS_PX, center[1] - HOT_SPOT_MARKER_RADIUS_PX),
+            )
+
+    def draw_spot_clusters(self, image: np.ndarray, scale: int) -> None:
+        for cluster_index, cluster in enumerate(self.spot_clusters, start=1):
+            position = self.hot_spot_area_pixel(cluster)
+            if position is None:
+                continue
+
+            col, row = position
+            height, width = self.area_image.shape
+            if col < 0.0 or col >= width or row < 0.0 or row >= height:
+                continue
+
+            center = (int(round(col * scale)), int(round(row * scale)))
+            cv2.drawMarker(
+                image,
+                center,
+                (0, 0, 0),
+                cv2.MARKER_STAR,
+                CLUSTER_MARKER_RADIUS_PX * 2 + 4,
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.drawMarker(
+                image,
+                center,
+                CLUSTER_MARKER_COLOR,
+                cv2.MARKER_STAR,
+                CLUSTER_MARKER_RADIUS_PX * 2,
+                1,
+                cv2.LINE_AA,
+            )
+            self.draw_label(
+                image,
+                f"cluster {cluster_index} ({cluster.member_count}) {cluster.temperature:.1f} C",
+                (
+                    center[0] + CLUSTER_MARKER_RADIUS_PX,
+                    center[1] + CLUSTER_MARKER_RADIUS_PX + 14,
+                ),
+            )
+
+    def hot_spot_area_pixel(self, hot_spot) -> tuple[float, float] | None:
+        if self.geotiff_mode:
+            if not np.isfinite(hot_spot.latitude) or not np.isfinite(hot_spot.longitude):
+                return None
+            return self.gps_to_area_pixel(hot_spot.latitude, hot_spot.longitude)
+
+        return self.world_to_area_pixel(hot_spot.east, hot_spot.north)
 
     def draw_drone_position(self, image: np.ndarray, scale: int) -> None:
         position = self.current_drone_area_pixel()
@@ -985,68 +978,10 @@ class Mapper:
         return False
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Display mapped grayscale images from MLX90640 frames."
-    )
-    parser.add_argument(
-        "--transport",
-        choices=("ecal", "zmq"),
-        default="ecal",
-        help="Transport to use for receiving frames and telemetry",
-    )
-    parser.add_argument(
-        "--connect",
-        default=DEFAULT_ENDPOINT,
-        help=f"ZeroMQ PUB endpoint to connect to, default: {DEFAULT_ENDPOINT}",
-    )
-    parser.add_argument(
-        "--thermal-topic",
-        default=DEFAULT_ECAL_THERMAL_TOPIC,
-        help=f"eCAL ThermalData topic, default: {DEFAULT_ECAL_THERMAL_TOPIC}",
-    )
-    parser.add_argument(
-        "--pprz-topic",
-        default=DEFAULT_ECAL_PPRZ_TOPIC,
-        help=f"eCAL PprzMsg topic, default: {DEFAULT_ECAL_PPRZ_TOPIC}",
-    )
-    parser.add_argument(
-        "--geotiff",
-        type=Path,
-        help="optional georeferenced satellite/orthophoto GeoTIFF background",
-    )
-    parser.add_argument(
-        "--heat-alpha",
-        type=float,
-        default=DEFAULT_HEAT_ALPHA,
-        help=f"thermal overlay alpha over GeoTIFF, default: {DEFAULT_HEAT_ALPHA}",
-    )
-    parser.add_argument(
-        "--ivy-bus",
-        default=None,
-        help="Ivy bus address and port for --transport zmq. Defaults to Paparazzi Ivy.",
-    )
-    return parser.parse_args()
-
-
 def main() -> None:
-    args = parse_args()
-    try:
-        mapper = Mapper(
-            args.connect,
-            args.ivy_bus,
-            args.transport,
-            args.thermal_topic,
-            args.pprz_topic,
-            args.geotiff,
-            args.heat_alpha,
-        )
-    except RuntimeError as exc:
-        print(exc, file=sys.stderr)
-        raise SystemExit(1) from exc
+    from thermal_spotter import main as thermal_spotter_main
 
-    with mapper:
-        mapper.run()
+    thermal_spotter_main(enable_map=True)
 
 
 if __name__ == "__main__":

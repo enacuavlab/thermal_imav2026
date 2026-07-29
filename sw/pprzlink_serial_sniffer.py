@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
@@ -13,16 +14,19 @@ import subprocess
 
 GENERATED_DIR = Path(__file__).resolve().parent.parent / "generated"
 DEFAULT_PPRZLINK_PYTHON = (
-    "/home/pprz/pprzlink/lib/v2.0/python/src"
+    "/home/fabien/paparazzi/sw/ext/pprzlink/lib/v2.0/python/src"
 )
-DEFAULT_ECAL_TOPIC = "pprz_msg"
+DEFAULT_ECAL_RX_TOPIC = "pprz_msg"
+DEFAULT_ECAL_TX_TOPIC = "pprz_msg_tx"
 
 sys.path.insert(0, str(Path(DEFAULT_PPRZLINK_PYTHON).expanduser()))
 sys.path.append(str(GENERATED_DIR))
 
 import ecal.nanobind_core as ecal_core
 import serial
+from ecal.msg.common.core import ReceiveCallbackData
 from ecal.msg.proto.core import Publisher as ProtoPublisher
+from ecal.msg.proto.core import Subscriber as ProtoSubscriber
 from pprzlink import messages_xml_map
 from pprzlink.message import PprzMessage
 from pprzlink.pprz_transport import PprzTransport
@@ -57,15 +61,7 @@ class EcalPprzPublisher:
         if self._owns_ecal and ecal_core.is_initialized():
             ecal_core.finalize()
 
-    def publish(
-        self,
-        source: int,
-        destination: int,
-        class_id: int,
-        msg_id: int,
-        message_name: str,
-        payload: bytes,
-    ) -> None:
+    def publish(self, source: int, destination: int, class_id: int, msg_id: int, message_name: str, payload: bytes) -> None:
         msg = PprzMsg(
             src=source,
             dst=destination,
@@ -75,6 +71,45 @@ class EcalPprzPublisher:
             payload=payload,
         )
         self._publisher.send(msg)
+
+
+class EcalPprzSerialSubscriber:
+    """Forward outgoing eCAL PPRZ messages to the transparent serial link."""
+
+    def __init__(self, topic: str, port: serial.Serial):
+        self._port = port
+        self._lock = threading.Lock()
+        self._transport = PprzTransport()
+        self._subscriber = ProtoSubscriber(PprzMsg, topic)
+        self._subscriber.set_receive_callback(self._on_receive)
+
+    def close(self) -> None:
+        self._subscriber.remove_receive_callback()
+
+    def _on_receive(
+        self,
+        pub_id: ecal_core.TopicId,
+        data: ReceiveCallbackData[PprzMsg],
+    ) -> None:
+        del pub_id
+        pprz_msg = data.message
+        try:
+            message = PprzMessage(pprz_msg.msg_class, pprz_msg.msg_id)
+            message.binary_to_payload(bytes(pprz_msg.payload))
+            packet = self._transport.pack_pprz_msg(
+                int(pprz_msg.src),
+                message,
+                int(pprz_msg.dst),
+            )
+            with self._lock:
+                self._port.write(packet)
+                self._port.flush()
+        except Exception as exc:
+            print(
+                f"Could not send {pprz_msg.msg_name} to serial: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def parse_packet(buffer: bytes) -> tuple[int, int, int, int, str, bytes]:
@@ -182,11 +217,7 @@ def stop_ecal_recording() -> None:
     ecal_rec = None
 
 
-def on_payload_command(
-    source: int,
-    destination: int,
-    pprz_message: PprzMessage,
-) -> None:
+def on_payload_command(source: int, destination: int, pprz_message: PprzMessage) -> None:
     # PAYLOAD_COMMAND needs domain-specific handling here.
     if chr(pprz_message.command[0]) == 'r':
         if pprz_message.command[1] == 1:
@@ -198,6 +229,10 @@ def on_payload_command(
             print("shutdown")
             stop_ecal_recording()
             subprocess.run(["sudo", "shutdown", "now"], check=False)
+    elif chr(pprz_message.command[0]) == 't':
+        threshold = pprz_message.command[1]
+        print(f"Threshold set to {threshold}°C")
+
     else:
         print(pprz_message)
 
@@ -216,14 +251,7 @@ def decode_pprz_message(class_id: int, msg_id: int, payload: bytes) -> PprzMessa
     return pprz_message
 
 
-def dispatch_message(
-    source: int,
-    destination: int,
-    class_id: int,
-    msg_id: int,
-    message_name: str,
-    payload: bytes,
-) -> None:
+def dispatch_message(source: int, destination: int, class_id: int, msg_id: int, message_name: str, payload: bytes) -> None:
     short_message_name = message_name.rsplit(".", 1)[-1]
     if short_message_name in {"PAYLOAD_COMMAND", "GPS_INT"}:
         try:
@@ -247,13 +275,15 @@ def run(args: argparse.Namespace) -> None:
         messages_xml_map.parse_messages(args.messages)
 
     transport = PprzTransport()
-    ecal_publisher = EcalPprzPublisher(args.ecal_topic)
+    ecal_publisher = EcalPprzPublisher(args.rx_topic)
+    ecal_subscriber: EcalPprzSerialSubscriber | None = None
 
     try:
         with serial.Serial(args.device, args.baudrate, timeout=args.timeout) as port:
+            ecal_subscriber = EcalPprzSerialSubscriber(args.tx_topic, port)
             print(
                 f"Listening on {args.device} at {args.baudrate} baud, "
-                f"publishing eCAL topic {args.ecal_topic}",
+                f"publishing {args.rx_topic} and forwarding {args.tx_topic}",
                 flush=True,
             )
             while True:
@@ -265,29 +295,13 @@ def run(args: argparse.Namespace) -> None:
                     continue
 
                 try:
-                    source, destination, class_id, msg_id, message_name, payload = parse_packet(
-                        bytes(transport.get_buffer())
-                    )
+                    source, destination, class_id, msg_id, message_name, payload = parse_packet(bytes(transport.get_buffer()))
                 except ValueError as exc:
                     print(f"Skipping packet: {exc}", file=sys.stderr, flush=True)
                     continue
 
-                dispatch_message(
-                    source,
-                    destination,
-                    class_id,
-                    msg_id,
-                    message_name,
-                    payload,
-                )
-                ecal_publisher.publish(
-                    source,
-                    destination,
-                    class_id,
-                    msg_id,
-                    message_name,
-                    payload,
-                )
+                dispatch_message(source, destination, class_id, msg_id, message_name, payload)
+                ecal_publisher.publish( source, destination, class_id, msg_id, message_name, payload)
                 if args.verbose:
                     print(
                         f"source={source} destination={destination} "
@@ -296,46 +310,24 @@ def run(args: argparse.Namespace) -> None:
                     )
     finally:
         stop_ecal_recording()
+        if ecal_subscriber is not None:
+            ecal_subscriber.close()
         ecal_publisher.close()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
+    parser = argparse.ArgumentParser(description=(
             "Open a serial device, read transparent PPRZLink v2 packets, "
             "and print source, destination, message name, and binary payload."
-        )
+            )
     )
     parser.add_argument("device", help="serial device, e.g. /dev/ttyUSB0")
-    parser.add_argument(
-        "-b",
-        "--baudrate",
-        type=int,
-        default=115200,
-        help="serial baudrate (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=1.0,
-        help="serial read timeout in seconds (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--messages",
-        type=Path,
-        help="optional messages.xml path for message-name lookup",
-    )
-    parser.add_argument(
-        "--ecal-topic",
-        default=DEFAULT_ECAL_TOPIC,
-        help="eCAL topic for PprzMsg publishing (default: %(default)s)",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="print received messages to stdout",
-    )
+    parser.add_argument("-b", "--baudrate", type=int, default=115200, help="serial baudrate (default: %(default)s)")
+    parser.add_argument("--timeout", type=float, default=1.0, help="serial read timeout in seconds (default: %(default)s)")
+    parser.add_argument("--messages", type=Path, help="optional messages.xml path for message-name lookup")
+    parser.add_argument("--rx-topic", default=DEFAULT_ECAL_RX_TOPIC, help="eCAL topic for received PprzMsg publishing (default: %(default)s)")
+    parser.add_argument("--tx-topic", default=DEFAULT_ECAL_TX_TOPIC, help="eCAL topic for outgoing PprzMsg forwarding (default: %(default)s)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="print received messages to stdout")
     args = parser.parse_args()
 
     try:
