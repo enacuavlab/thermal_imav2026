@@ -1,3 +1,7 @@
 lxml
 pyserial
+numpy
+pyproj
+scipy
+
 #eclipse-ecal

@@ -12,15 +12,14 @@ from pathlib import Path
 import subprocess
 
 
-GENERATED_DIR = Path(__file__).resolve().parent.parent / "generated"
-DEFAULT_PPRZLINK_PYTHON = (
-    "/home/fabien/paparazzi/sw/ext/pprzlink/lib/v2.0/python/src"
-)
+
 DEFAULT_ECAL_RX_TOPIC = "pprz_msg"
 DEFAULT_ECAL_TX_TOPIC = "pprz_msg_tx"
 
-sys.path.insert(0, str(Path(DEFAULT_PPRZLINK_PYTHON).expanduser()))
+GENERATED_DIR = Path(__file__).resolve().parent.parent / "generated"
 sys.path.append(str(GENERATED_DIR))
+sys.path.append("/home/fabien/paparazzi/sw/ext/pprzlink/lib/v2.0/python/src")
+sys.path.append("/home/pprz/pprzlink/lib/v2.0/python/src")
 
 import ecal.nanobind_core as ecal_core
 import serial

@@ -23,12 +23,9 @@ from pyproj import Transformer
 
 
 GENERATED_DIR = Path(__file__).resolve().parent.parent / "generated"
-DEFAULT_PPRZLINK_PYTHON = (
-    "/home/fabien/paparazzi/sw/ext/pprzlink/lib/v2.0/python/src"
-)
-
-sys.path.insert(0, str(Path(DEFAULT_PPRZLINK_PYTHON).expanduser()))
 sys.path.append(str(GENERATED_DIR))
+sys.path.append("/home/fabien/paparazzi/sw/ext/pprzlink/lib/v2.0/python/src")
+sys.path.append("/home/pprz/pprzlink/lib/v2.0/python/src")
 
 from pprzlink.message import PprzMessage
 from thermal_pb2 import PprzMsg, ThermalData
