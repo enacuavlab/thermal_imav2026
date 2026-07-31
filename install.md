@@ -29,7 +29,7 @@ Activate "octir" connection:
 # Overlays
 
 sudo rsetup
-Overlays -> Install 3rd party overlay -> i2c400k
+Overlays -> Install 3rd party overlay -> i2c400k.dtbo
 
 Overlays -> Manage ->
 Enable I2C4-M0
@@ -39,13 +39,14 @@ Enable UART3-M0
 git clone https://github.com/paparazzi/pprzlink.git
 clone thermal
 
-python3 -m venv thermenv
-echo "source /home/pprz/thermenv/bin/activate" >> .bashrc
+python3 -m venv termenv
+echo "source /home/pprz/termenv/bin/activate" >> ~/.bashrc
 
+## Install eCAL
 
-build/_deploy/ecal_6.1.1_arm64.deb
-
-dist/eclipse_ecal-6.2.0a1.dev50+g7a8ee406d.d20260616-cp311-cp311-linux_aarch64.whl
+`cd sd/ecal`
+`sudo dpkg -i build/_deploy/ecal_6.1.1_arm64.deb`
+`pip install dist/eclipse_ecal-6.2.0a1.dev50+g7a8ee406d.d20260616-cp311-cp311-linux_aarch64.whl`
 
 
 ## thermal
@@ -56,3 +57,15 @@ pip install -r requirements.txt
 
 Add to the fstab:
 `/dev/mmcblk1p1  /home/pprz/sd  ext4  defaults,noatime  0  2`
+
+
+## Allow passwordless shutdown
+
+sudo cp pprzlink-shutdown /etc/sudoers.d/
+
+# Build MLX driver
+
+sudo apt install cmake libprotobuf-dev protobuf-compiler libcli11-dev libzmq3-dev
+makdir build && cd build
+cmake ..
+make -j4
