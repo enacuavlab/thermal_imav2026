@@ -209,6 +209,11 @@ class ThermalMap:
     def update_spot_clusters(self, spot_clusters) -> None:
         self.spot_clusters = list(spot_clusters)
 
+    def reset_spots(self) -> None:
+        """Remove detected spots and clusters from the map overlay."""
+        self.hot_spots.clear()
+        self.spot_clusters.clear()
+
     def update_drone_position_bounds(self, position_m: np.ndarray) -> None:
         east = float(position_m[0])
         north = float(position_m[1])

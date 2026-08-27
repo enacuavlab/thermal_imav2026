@@ -230,11 +230,27 @@ class ThermalSpotter:
 
     def on_payload_command(self, msg: PprzMessage) -> None:
         command = msg["command"]
-        if len(command) < 2 or int(command[0]) != ord("t"):
+        if len(command) < 2:
             return
+        
+        if int(command[0]) == ord("h"):
+            self.threshold_c = float(command[1])
+            self.spot_kind = "hot"
+            self.reset_spots()
+            print(f"Threshold set to hot {self.threshold_c:.1f} C", flush=True)
 
-        self.threshold_c = float(command[1])
-        print(f"Threshold set to {self.threshold_c:.1f} C", flush=True)
+        elif int(command[0]) == ord("c"):
+            self.threshold_c = float(command[1])
+            self.spot_kind = "cold"
+            self.reset_spots()
+            print(f"Threshold set to cold {self.threshold_c:.1f} C", flush=True)
+
+    def reset_spots(self) -> None:
+        """Discard detections accumulated under the previous threshold."""
+        self.hot_spots.clear()
+        self.spot_clusters.clear()
+        if self.thermal_map is not None:
+            self.thermal_map.reset_spots()
 
     def process_frame(self, frame: dict) -> HotSpot | None:
         spot_pixel = self.detect_spot_pixel(frame, self.spot_kind)

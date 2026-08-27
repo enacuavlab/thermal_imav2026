@@ -228,9 +228,12 @@ def on_payload_command(source: int, destination: int, pprz_message: PprzMessage)
             print("shutdown")
             stop_ecal_recording()
             subprocess.run(["sudo", "shutdown", "now"], check=False)
-    elif chr(pprz_message.command[0]) == 't':
+    elif chr(pprz_message.command[0]) == 'h':
         threshold = pprz_message.command[1]
-        print(f"Threshold set to {threshold}°C")
+        print(f"Threshold set to hot {threshold}°C")
+    elif chr(pprz_message.command[0]) == 'c':
+        threshold = pprz_message.command[1]
+        print(f"Threshold set to cold {threshold}°C")
 
     else:
         print(pprz_message)
