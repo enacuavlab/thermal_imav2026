@@ -16,14 +16,27 @@ from typing import Protocol
 from PyQt5 import QtCore, QtGui, QtWidgets
 import zmq
 
-import ecal.nanobind_core as ecal_core
-from ecal.msg.common.core import ReceiveCallbackData
-from ecal.msg.proto.core import Subscriber as ProtoSubscriber
-
 GENERATED_DIR = Path(__file__).resolve().parent.parent / "generated"
 sys.path.append(str(GENERATED_DIR))
 
-from thermal_pb2 import ThermalData
+try:
+    import ecal.nanobind_core as ecal_core
+    from ecal.msg.common.core import ReceiveCallbackData
+    from ecal.msg.proto.core import Subscriber as ProtoSubscriber
+except ImportError as error:
+    ecal_core = None
+    print(f"eCAL unavailable ({error}); using ZeroMQ only.", file=sys.stderr)
+else:
+    try:
+        from thermal_pb2 import ThermalData
+    except ImportError as error:
+        ecal_core = None
+        print(
+            f"thermal_pb2 unavailable ({error}); using ZeroMQ only. "
+            "Generate the Python protobuf module by running "
+            "'cd proto && bash generate_proto.sh' from the project root.",
+            file=sys.stderr,
+        )
 
 
 DEFAULT_ENDPOINT = "tcp://127.0.0.1:5555"
@@ -151,8 +164,10 @@ class StatTile(QtWidgets.QFrame):
 
 
 class ThermalFrame(QtWidgets.QWidget):
-    def __init__(self):
+    def __init__(self, min_temp: float | None = None, max_temp: float | None = None):
         super().__init__()
+        self.min_temp = min_temp
+        self.max_temp = max_temp
         self.width_px = DEFAULT_WIDTH
         self.height_px = DEFAULT_HEIGHT
         self.values: list[float | None] = []
@@ -188,13 +203,7 @@ class ThermalFrame(QtWidgets.QWidget):
             return
 
         image = QtGui.QImage(self.width_px, self.height_px, QtGui.QImage.Format_RGB32)
-        low = self.minimum
-        high = self.maximum
-        if not math.isfinite(low) or not math.isfinite(high):
-            low, high = 0.0, 1.0
-        if math.isclose(low, high):
-            low -= 1.0
-            high += 1.0
+        low, high = self._scale_limits()
 
         for row in range(self.height_px):
             for col in range(self.width_px):
@@ -211,6 +220,24 @@ class ThermalFrame(QtWidgets.QWidget):
         painter.setPen(QtGui.QPen(QtGui.QColor("#30363d"), 1))
         painter.drawRect(frame_rect)
         self._draw_scale(painter, frame_rect, low, high)
+
+    def _scale_limits(self) -> tuple[float, float]:
+        low = self.min_temp if self.min_temp is not None else self.minimum
+        high = self.max_temp if self.max_temp is not None else self.maximum
+        if not math.isfinite(low):
+            low = high - 1.0 if math.isfinite(high) else 0.0
+        if not math.isfinite(high):
+            high = low + 1.0
+        if self.min_temp is None or self.max_temp is None:
+            if low >= high or math.isclose(low, high):
+                if self.min_temp is None and self.max_temp is None:
+                    low -= 1.0
+                    high += 1.0
+                elif self.min_temp is None:
+                    low = high - 1.0
+                else:
+                    high = low + 1.0
+        return low, high
 
     def _frame_rect(self) -> QtCore.QRect:
         outer = self.rect().adjusted(12, 12, -78, -12)
@@ -267,7 +294,8 @@ class ThermalFrame(QtWidgets.QWidget):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, subscriber: FrameSubscriber):
+    def __init__(self, subscriber: FrameSubscriber, min_temp: float | None = None,
+                 max_temp: float | None = None):
         super().__init__()
         self.subscriber = subscriber
         self.last_message_time = None
@@ -284,7 +312,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.frame_tile = StatTile("Frame")
         self.count_tile = StatTile("Pixels")
         self.age_tile = StatTile("Age", " s")
-        self.frame_widget = ThermalFrame()
+        self.frame_widget = ThermalFrame(min_temp, max_temp)
 
         tile_row = QtWidgets.QHBoxLayout()
         for tile in (
@@ -371,11 +399,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--connect", default=DEFAULT_ENDPOINT, help="ZeroMQ endpoint to connect to")
     parser.add_argument("--topic", default=DEFAULT_ECAL_TOPIC, help="eCAL topic to subscribe to")
-    return parser.parse_args()
+    parser.add_argument("--min-temp", type=float, help="Color scale minimum in Celsius (default: frame minimum)")
+    parser.add_argument("--max-temp", type=float, help="Color scale maximum in Celsius (default: frame maximum)")
+    args = parser.parse_args()
+    for name in ("min_temp", "max_temp"):
+        value = getattr(args, name)
+        if value is not None and not math.isfinite(value):
+            parser.error(f"--{name.replace('_', '-')} must be finite")
+    if args.min_temp is not None and args.max_temp is not None and args.min_temp >= args.max_temp:
+        parser.error("--min-temp must be less than --max-temp")
+    return args
 
 
 def make_subscriber(args: argparse.Namespace) -> FrameSubscriber:
-    if args.transport == "ecal":
+    if args.transport == "ecal" and ecal_core is not None:
         return EcalFrameSubscriber(args.topic)
     return ZmqFrameSubscriber(args.connect)
 
@@ -418,7 +455,7 @@ def main() -> int:
         """
     )
 
-    window = MainWindow(subscriber)
+    window = MainWindow(subscriber, args.min_temp, args.max_temp)
     window.show()
     return app.exec_()
 
