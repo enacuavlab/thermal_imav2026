@@ -31,6 +31,7 @@ from pprzlink.message import PprzMessage
 from thermal_pb2 import PprzMsg, ThermalData
 from thermal_common import (
     QueuedPprzMsg,
+    ROTORCRAFT_FP_POS_SCALE,
     ThermalCameraModel,
     pprz_message_name,
     pprz_proto_to_queued,
@@ -199,7 +200,7 @@ class ThermalSpotter:
     def process_pprz_message(self, pprz_msg: QueuedPprzMsg) -> None:
         _, _, msg_class, msg_id, msg_name, payload = pprz_msg
         message_name = pprz_message_name(msg_name)
-        if message_name not in {"ROTORCRAFT_FP", "INS_REF", "GPS_INT", "PAYLOAD_COMMAND"}:
+        if message_name not in {"ROTORCRAFT_FP", "INS", "INS_REF", "GPS_INT", "PAYLOAD_COMMAND"}:
             return
 
         try:
@@ -213,6 +214,17 @@ class ThermalSpotter:
             self.last_position_m = rotorcraft_position_m(msg)
             self.last_attitude_deg = rotorcraft_attitude_deg(msg)
             if self.thermal_map is not None:
+                self.thermal_map.update_aircraft_state(
+                    self.last_position_m,
+                    self.last_attitude_deg,
+                )
+        elif message_name == "INS":
+            # INS position is fixed-point NED; projection uses ENU meters.
+            self.last_position_m = np.array(
+                [float(msg["ins_y"]), float(msg["ins_x"]), -float(msg["ins_z"])],
+                dtype=np.float32,
+            ) * ROTORCRAFT_FP_POS_SCALE
+            if self.thermal_map is not None and self.last_attitude_deg is not None:
                 self.thermal_map.update_aircraft_state(
                     self.last_position_m,
                     self.last_attitude_deg,
