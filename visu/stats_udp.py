@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 
-"""Stream the stats viewer as JPEG datagrams to the PprzGCS video viewer."""
+"""Stream thermal images as JPEG datagrams to the PprzGCS video viewer."""
 
 from __future__ import annotations
 
 import argparse
 import math
-import os
 import signal
 import socket
 import sys
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtGui
+import zmq
 
 import stats_viewer
 
@@ -48,7 +48,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=5600, help="Destination UDP port (default: 5600)")
     parser.add_argument("--fps", type=float, default=10, help="Output frames per second (default: 10)")
     parser.add_argument("--quality", type=int, default=85, help="Maximum JPEG quality, 1-100 (default: 85)")
-    parser.add_argument("--preview", action="store_true", help="Also show the local viewer window")
+    parser.add_argument("--scale", type=int, default=20, help="Pixel enlargement factor (default: 20, giving 640x480 for 32x24 input)")
     args = stats_viewer.parse_args(argv, parser)
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
@@ -56,15 +56,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--fps must be between 0.1 and 1000")
     if not 1 <= args.quality <= 100:
         parser.error("--quality must be between 1 and 100")
+    if not 1 <= args.scale <= 100:
+        parser.error("--scale must be between 1 and 100")
     return args
 
 
 def main() -> int:
     args = parse_args()
-    if not args.preview:
-        os.environ["QT_QPA_PLATFORM"] = "offscreen"
-    app = QtWidgets.QApplication([sys.argv[0]])
-    stats_viewer.apply_style(app)
+    app = QtCore.QCoreApplication([sys.argv[0]])
     try:
         destination = (socket.gethostbyname(args.host), args.port)
         subscriber = stats_viewer.make_subscriber(args)
@@ -72,17 +71,31 @@ def main() -> int:
         print(error, file=sys.stderr)
         return 1
 
-    window = stats_viewer.MainWindow(subscriber, args.min_temp, args.max_temp)
+    frame = stats_viewer.ThermalImage(args.min_temp, args.max_temp)
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Showing on the offscreen platform activates the same layout as the GUI.
-    window.show()
     exit_code = 0
+    jpeg = None
 
     def send_frame() -> None:
-        nonlocal exit_code
+        nonlocal exit_code, jpeg
         try:
-            jpeg = encode_frame(window.grab().toImage(), args.quality)
-            udp.sendto(jpeg, destination)
+            message = subscriber.receive_latest()
+            if message is not None:
+                frame.set_frame(
+                    int(message.get("width", stats_viewer.DEFAULT_WIDTH)),
+                    int(message.get("height", stats_viewer.DEFAULT_HEIGHT)),
+                    message.get("temperatures", []),
+                )
+                if frame.values:
+                    image = frame.to_image().scaled(
+                        frame.width_px * args.scale, frame.height_px * args.scale,
+                        QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.FastTransformation,
+                    )
+                    jpeg = encode_frame(image, args.quality)
+            if jpeg is not None:
+                udp.sendto(jpeg, destination)
+        except (ValueError, TypeError, UnicodeDecodeError, zmq.ZMQError) as error:
+            print(f"Invalid thermal frame: {error}", file=sys.stderr)
         except (OSError, RuntimeError) as error:
             print(f"UDP video error: {error}", file=sys.stderr)
             exit_code = 1
@@ -100,7 +113,7 @@ def main() -> int:
         app.exec_()
     finally:
         timer.stop()
-        window.close()
+        subscriber.close()
         udp.close()
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)

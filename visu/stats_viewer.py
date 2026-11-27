@@ -163,9 +163,8 @@ class StatTile(QtWidgets.QFrame):
         self.value_label.setText(text)
 
 
-class ThermalFrame(QtWidgets.QWidget):
+class ThermalImage:
     def __init__(self, min_temp: float | None = None, max_temp: float | None = None):
-        super().__init__()
         self.min_temp = min_temp
         self.max_temp = max_temp
         self.width_px = DEFAULT_WIDTH
@@ -173,7 +172,6 @@ class ThermalFrame(QtWidgets.QWidget):
         self.values: list[float | None] = []
         self.minimum = math.nan
         self.maximum = math.nan
-        self.setMinimumSize(560, 420)
 
     def set_frame(self, width: int, height: int, values: list) -> None:
         if width <= 0 or height <= 0 or len(values) != width * height:
@@ -188,38 +186,18 @@ class ThermalFrame(QtWidgets.QWidget):
         else:
             self.minimum = math.nan
             self.maximum = math.nan
-        self.update()
 
-    def paintEvent(self, event) -> None:
-        del event
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
-        painter.fillRect(self.rect(), QtGui.QColor("#0d1117"))
-
-        frame_rect = self._frame_rect()
-        if not self.values:
-            painter.setPen(QtGui.QColor("#8b949e"))
-            painter.drawText(frame_rect, QtCore.Qt.AlignCenter, "Waiting for frame")
-            return
-
+    def to_image(self) -> QtGui.QImage:
         image = QtGui.QImage(self.width_px, self.height_px, QtGui.QImage.Format_RGB32)
+        image.fill(QtGui.QColor("#111111"))
+        if not self.values:
+            return image
         low, high = self._scale_limits()
-
         for row in range(self.height_px):
             for col in range(self.width_px):
                 value = self.values[row * self.width_px + col]
-                color = self._color_for(value, low, high)
-                image.setPixelColor(self.width_px - 1 - col, row, color)
-
-        painter.drawImage(frame_rect, image.scaled(
-            frame_rect.size(),
-            QtCore.Qt.IgnoreAspectRatio,
-            QtCore.Qt.FastTransformation,
-        ))
-
-        painter.setPen(QtGui.QPen(QtGui.QColor("#30363d"), 1))
-        painter.drawRect(frame_rect)
-        self._draw_scale(painter, frame_rect, low, high)
+                image.setPixelColor(self.width_px - 1 - col, row, self._color_for(value, low, high))
+        return image
 
     def _scale_limits(self) -> tuple[float, float]:
         low = self.min_temp if self.min_temp is not None else self.minimum
@@ -238,31 +216,6 @@ class ThermalFrame(QtWidgets.QWidget):
                 else:
                     high = low + 1.0
         return low, high
-
-    def _frame_rect(self) -> QtCore.QRect:
-        outer = self.rect().adjusted(12, 12, -78, -12)
-        target_ratio = self.width_px / self.height_px
-        current_ratio = outer.width() / max(outer.height(), 1)
-        if current_ratio > target_ratio:
-            width = int(outer.height() * target_ratio)
-            x = outer.left() + (outer.width() - width) // 2
-            return QtCore.QRect(x, outer.top(), width, outer.height())
-        height = int(outer.width() / target_ratio)
-        y = outer.top() + (outer.height() - height) // 2
-        return QtCore.QRect(outer.left(), y, outer.width(), height)
-
-    def _draw_scale(self, painter: QtGui.QPainter, frame_rect: QtCore.QRect, low: float, high: float) -> None:
-        scale = QtCore.QRect(frame_rect.right() + 18, frame_rect.top(), 22, frame_rect.height())
-        for y in range(scale.height()):
-            t = 1.0 - y / max(scale.height() - 1, 1)
-            painter.setPen(self._palette(t))
-            painter.drawLine(scale.left(), scale.top() + y, scale.right(), scale.top() + y)
-
-        painter.setPen(QtGui.QColor("#c9d1d9"))
-        painter.drawText(scale.right() + 8, scale.top() + 8, f"{high:.1f} C")
-        painter.drawText(scale.right() + 8, scale.bottom(), f"{low:.1f} C")
-        painter.setPen(QtGui.QPen(QtGui.QColor("#30363d"), 1))
-        painter.drawRect(scale)
 
     def _color_for(self, value: float | None, low: float, high: float) -> QtGui.QColor:
         if value is None or not math.isfinite(value):
@@ -291,6 +244,67 @@ class ThermalFrame(QtWidgets.QWidget):
                 ]
                 return QtGui.QColor(*rgb)
         return QtGui.QColor(*stops[-1][1])
+
+
+class ThermalFrame(QtWidgets.QWidget, ThermalImage):
+    def __init__(self, min_temp: float | None = None, max_temp: float | None = None):
+        QtWidgets.QWidget.__init__(self)
+        ThermalImage.__init__(self, min_temp, max_temp)
+        self.setMinimumSize(560, 420)
+
+    def set_frame(self, width: int, height: int, values: list) -> None:
+        ThermalImage.set_frame(self, width, height, values)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        del event
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        painter.fillRect(self.rect(), QtGui.QColor("#0d1117"))
+
+        frame_rect = self._frame_rect()
+        if not self.values:
+            painter.setPen(QtGui.QColor("#8b949e"))
+            painter.drawText(frame_rect, QtCore.Qt.AlignCenter, "Waiting for frame")
+            return
+
+        image = self.to_image()
+        low, high = self._scale_limits()
+
+        painter.drawImage(frame_rect, image.scaled(
+            frame_rect.size(),
+            QtCore.Qt.IgnoreAspectRatio,
+            QtCore.Qt.FastTransformation,
+        ))
+
+        painter.setPen(QtGui.QPen(QtGui.QColor("#30363d"), 1))
+        painter.drawRect(frame_rect)
+        self._draw_scale(painter, frame_rect, low, high)
+
+    def _frame_rect(self) -> QtCore.QRect:
+        outer = self.rect().adjusted(12, 12, -78, -12)
+        target_ratio = self.width_px / self.height_px
+        current_ratio = outer.width() / max(outer.height(), 1)
+        if current_ratio > target_ratio:
+            width = int(outer.height() * target_ratio)
+            x = outer.left() + (outer.width() - width) // 2
+            return QtCore.QRect(x, outer.top(), width, outer.height())
+        height = int(outer.width() / target_ratio)
+        y = outer.top() + (outer.height() - height) // 2
+        return QtCore.QRect(outer.left(), y, outer.width(), height)
+
+    def _draw_scale(self, painter: QtGui.QPainter, frame_rect: QtCore.QRect, low: float, high: float) -> None:
+        scale = QtCore.QRect(frame_rect.right() + 18, frame_rect.top(), 22, frame_rect.height())
+        for y in range(scale.height()):
+            t = 1.0 - y / max(scale.height() - 1, 1)
+            painter.setPen(self._palette(t))
+            painter.drawLine(scale.left(), scale.top() + y, scale.right(), scale.top() + y)
+
+        painter.setPen(QtGui.QColor("#c9d1d9"))
+        painter.drawText(scale.right() + 8, scale.top() + 8, f"{high:.1f} C")
+        painter.drawText(scale.right() + 8, scale.bottom(), f"{low:.1f} C")
+        painter.setPen(QtGui.QPen(QtGui.QColor("#30363d"), 1))
+        painter.drawRect(scale)
 
 
 class MainWindow(QtWidgets.QMainWindow):
