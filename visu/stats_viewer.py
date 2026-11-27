@@ -389,8 +389,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_label.setText(f"No message for {age:.1f}s")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PyQt5 viewer for MLX90640 frames")
+def parse_args(argv: list[str] | None = None,
+               parser: argparse.ArgumentParser | None = None) -> argparse.Namespace:
+    if parser is None:
+        parser = argparse.ArgumentParser(description="PyQt5 viewer for MLX90640 frames")
     parser.add_argument(
         "--transport",
         choices=("zmq", "ecal"),
@@ -401,7 +403,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topic", default=DEFAULT_ECAL_TOPIC, help="eCAL topic to subscribe to")
     parser.add_argument("--min-temp", type=float, help="Color scale minimum in Celsius (default: frame minimum)")
     parser.add_argument("--max-temp", type=float, help="Color scale maximum in Celsius (default: frame maximum)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     for name in ("min_temp", "max_temp"):
         value = getattr(args, name)
         if value is not None and not math.isfinite(value):
@@ -417,15 +419,7 @@ def make_subscriber(args: argparse.Namespace) -> FrameSubscriber:
     return ZmqFrameSubscriber(args.connect)
 
 
-def main() -> int:
-    args = parse_args()
-    try:
-        subscriber = make_subscriber(args)
-    except RuntimeError as error:
-        print(error, file=sys.stderr)
-        return 1
-
-    app = QtWidgets.QApplication(sys.argv)
+def apply_style(app: QtWidgets.QApplication) -> None:
     app.setStyleSheet(
         """
         QMainWindow, QWidget {
@@ -455,6 +449,17 @@ def main() -> int:
         """
     )
 
+
+def main() -> int:
+    args = parse_args()
+    try:
+        subscriber = make_subscriber(args)
+    except RuntimeError as error:
+        print(error, file=sys.stderr)
+        return 1
+
+    app = QtWidgets.QApplication(sys.argv)
+    apply_style(app)
     window = MainWindow(subscriber, args.min_temp, args.max_temp)
     window.show()
     return app.exec_()
