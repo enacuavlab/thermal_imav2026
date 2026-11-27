@@ -20,21 +20,22 @@ Or receive the protobuf frames published on eCAL:
 python3 visu/stats_viewer.py --transport ecal --topic mlx90640_data
 ```
 
-To send the same viewer image (thermal frame, color scale, and statistics) to
+To send only the thermal image, using the viewer's palette and horizontal flip, to
 the PprzGCS video panel, install `visu/requirements.txt` and run:
 
 ```bash
 python3 visu/stats_udp.py --connect tcp://127.0.0.1:5555
 ```
 
-The sender runs offscreen by default and sends complete JPEGs to
+The sender is a CLI app with no window or display-server requirement. It sends
+only thermal pixels, without statistics, text, borders, or a color scale, as JPEGs to
 `127.0.0.1:5600`, one per UDP datagram. In PprzGCS Devices settings, add a stream
 with source `udp://:5600` and select it in the Video panel. If no cameras are
 configured, the panel's default source already uses that port. A layout can
 also configure it explicitly:
 
 ```xml
-<widget name="video"><configure source="udp://:5600" width="900"/></widget>
+<widget name="video"><configure source="udp://:5600" width="640"/></widget>
 ```
 
 For eCAL input, a fixed temperature scale, or a different port:
@@ -46,12 +47,23 @@ python3 visu/stats_udp.py --transport ecal --topic mlx90640_data \
 
 Use `udp://:5602` in PprzGCS for that example. The same eCAL availability and
 ZeroMQ fallback behavior as `stats_viewer.py` applies.
-`--preview` also opens the local viewer; `--fps` (default 10), `--quality`
+`--scale` (default 20) enlarges sensor pixels without smoothing, producing
+640×480 images for 32×24 input; use `--scale 1` for native resolution.
+The GCS video panel displays frames as received. Use `--rotate 90`,
+`--rotate 180`, or `--rotate 270` to rotate clockwise in the sender
+(default: `--rotate 0`). Rotation follows the viewer's horizontal flip;
+90° and 270° swap the output width and height. For example:
+
+```bash
+python3 visu/stats_udp.py --rotate 90 --port 5600
+```
+
+`--fps` (default 10), `--quality`
 (default 85), and `--host` (default `127.0.0.1`) control output. JPEG quality
 is reduced automatically if necessary to fit the 65,507-byte UDP payload limit;
 exceptionally large images are also scaled down. The sender continues streaming
-the last frame with its age when input stops, and shows “Waiting for frame”
-before the first input arrives. Stop with Ctrl+C.
+the last image when input stops, and waits for the first thermal frame before
+sending video. Stop with Ctrl+C.
 
 Expected message shape:
 

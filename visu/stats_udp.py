@@ -19,6 +19,16 @@ import stats_viewer
 MAX_DATAGRAM_SIZE = 65507  # Maximum IPv4 UDP payload, including the complete JPEG.
 
 
+def render_frame(frame: stats_viewer.ThermalImage, scale: int, rotation: int) -> QtGui.QImage:
+    image = frame.to_image()
+    if rotation:
+        image = image.transformed(QtGui.QTransform().rotate(rotation))
+    return image.scaled(
+        image.width() * scale, image.height() * scale,
+        QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.FastTransformation,
+    )
+
+
 def encode_frame(image: QtGui.QImage, quality: int) -> bytes:
     """Keep a complete JPEG in one datagram; PprzGCS does no reassembly."""
     while True:
@@ -49,6 +59,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=10, help="Output frames per second (default: 10)")
     parser.add_argument("--quality", type=int, default=85, help="Maximum JPEG quality, 1-100 (default: 85)")
     parser.add_argument("--scale", type=int, default=20, help="Pixel enlargement factor (default: 20, giving 640x480 for 32x24 input)")
+    parser.add_argument("--rotate", type=int, choices=(0, 90, 180, 270), default=0,
+                        help="Clockwise rotation in degrees, after the viewer's horizontal flip (default: 0)")
     args = stats_viewer.parse_args(argv, parser)
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
@@ -87,10 +99,7 @@ def main() -> int:
                     message.get("temperatures", []),
                 )
                 if frame.values:
-                    image = frame.to_image().scaled(
-                        frame.width_px * args.scale, frame.height_px * args.scale,
-                        QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.FastTransformation,
-                    )
+                    image = render_frame(frame, args.scale, args.rotate)
                     jpeg = encode_frame(image, args.quality)
             if jpeg is not None:
                 udp.sendto(jpeg, destination)
